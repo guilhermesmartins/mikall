@@ -9,6 +9,7 @@ members = [
     "crates/mikall-store",
     "crates/mikall-node",
     "crates/mikall-irc",
+    "crates/mikall-ui",
 ]
 
 [workspace.package]
@@ -45,6 +46,7 @@ ciborium = "0.2"
 redb = "2"
 uuid = { version = "1", features = ["v7"] }
 anyhow = "1"
+iced = { version = "0.13", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
