@@ -1,0 +1,41 @@
+[package]
+name = "mikall-net"
+description = "Driven adapter: libp2p swarm — gossipsub channels, Kademlia discovery, mDNS, signed envelopes, direct-message protocol."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mikall-domain = { workspace = true }
+mikall-app = { workspace = true }
+mikall-crypto = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }
+tracing = { workspace = true }
+serde = { workspace = true }
+ciborium = { workspace = true }
+blake3 = { workspace = true }
+libp2p = { workspace = true, features = [
+    "tokio",
+    "tcp",
+    "quic",
+    "dns",
+    "noise",
+    "yamux",
+    "gossipsub",
+    "kad",
+    "mdns",
+    "identify",
+    "ping",
+    "request-response",
+    "cbor",
+    "macros",
+    "ed25519",
+] }
+
+[lints]
+workspace = true

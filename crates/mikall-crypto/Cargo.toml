@@ -1,0 +1,22 @@
+[package]
+name = "mikall-crypto"
+description = "Driven adapter: identity key custody, envelope signing/verification, content-derived ids."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mikall-domain = { workspace = true }
+mikall-app = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+blake3 = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+zeroize = { workspace = true }
+uuid = { workspace = true }
+
+[lints]
+workspace = true

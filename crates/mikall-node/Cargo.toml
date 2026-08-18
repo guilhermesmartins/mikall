@@ -1,0 +1,31 @@
+[package]
+name = "mikall-node"
+description = "Composition root: wires production adapters into a NodeHandle shared by every frontend; ships the mikalld headless binary."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mikall-domain = { workspace = true }
+mikall-app = { workspace = true }
+mikall-crypto = { workspace = true }
+mikall-net = { workspace = true }
+mikall-store = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "io-std", "io-util", "time", "signal"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+libp2p = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+
+[[bin]]
+name = "mikalld"
+path = "src/bin/mikalld.rs"
+
+[lints]
+workspace = true
