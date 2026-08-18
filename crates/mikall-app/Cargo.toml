@@ -1,0 +1,23 @@
+[package]
+name = "mikall-app"
+description = "Application layer of mikall: use-case services and the hexagon's ports. Depends only on the domain."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mikall-domain = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+wildcard_enum_match_arm = "deny"

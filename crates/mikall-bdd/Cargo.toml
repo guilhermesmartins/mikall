@@ -1,0 +1,25 @@
+[package]
+name = "mikall-bdd"
+description = "Cucumber BDD suite driving the application layer through in-memory adapters, plus the fakes themselves."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mikall-domain = { workspace = true }
+mikall-app = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
+
+[dev-dependencies]
+cucumber = { workspace = true }
+futures = { workspace = true }
+
+[[test]]
+name = "bdd"
+harness = false
+
+[lints]
+workspace = true
