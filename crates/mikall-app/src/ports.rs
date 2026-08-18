@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 
 use mikall_domain::calls::CallId;
-use mikall_domain::messaging::{ChannelId, ChannelName, MessageId, Verified};
+use mikall_domain::messaging::{ChannelId, ChannelName, MessageId, Nickname, Verified};
 use mikall_domain::shared::{Fingerprint, IdentityId};
 use mikall_domain::transfer::TransferId;
 
@@ -151,6 +151,32 @@ pub trait MessageStore: Send + Sync {
         &self,
         channel: ChannelId,
     ) -> Result<Vec<WireMessage>, StoreError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ProfileStoreError {
+    #[error("profile storage failure: {0}")]
+    Other(String),
+}
+
+/// The locally persisted slice of the profile. Every field is `Option` +
+/// `Default` so later milestones (IRC gateway config, local settings) add
+/// fields here without changing the [`ProfileStore`] trait and without
+/// invalidating records written before the field existed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProfileRecord {
+    /// The announced nickname, once the user has chosen one.
+    pub nickname: Option<Nickname>,
+}
+
+/// Local persistence of the profile record (redb in production). Callers
+/// mutate via read-modify-write — load, change a field, save — so fields
+/// they don't know about survive the round trip.
+#[async_trait]
+pub trait ProfileStore: Send + Sync {
+    /// The stored record, or [`ProfileRecord::default`] when none exists yet.
+    async fn load(&self) -> Result<ProfileRecord, ProfileStoreError>;
+    async fn save(&self, record: &ProfileRecord) -> Result<(), ProfileStoreError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

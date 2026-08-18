@@ -17,7 +17,8 @@ use mikall_app::events::{AppEvent, EventBus};
 use mikall_app::ports::{
     BlobStore, CallAction, CallSignaling, ChannelRecord, ChannelSignal, ChatTransport, ChunkHasher,
     Clock, Directory, DirectoryError, FileTransport, IdGen, InboundHandler, KeyStore,
-    KeyStoreError, MessageStore, StoreError, TransportError, WireMessage,
+    KeyStoreError, MessageStore, ProfileRecord, ProfileStore, ProfileStoreError, StoreError,
+    TransportError, WireMessage,
 };
 use mikall_app::services::{
     CallService, ChatService, DmService, IdentityService, InboundRouter, PresenceService, Profile,
@@ -254,6 +255,24 @@ impl Directory for InMemoryDirectory {
 
     async fn list_channels(&self) -> Result<Vec<ChannelRecord>, DirectoryError> {
         Ok(self.records.read().await.values().cloned().collect())
+    }
+}
+
+/// Per-node in-memory profile store.
+#[derive(Debug, Default)]
+pub struct InMemoryProfileStore {
+    record: RwLock<ProfileRecord>,
+}
+
+#[async_trait]
+impl ProfileStore for InMemoryProfileStore {
+    async fn load(&self) -> Result<ProfileRecord, ProfileStoreError> {
+        Ok(self.record.read().await.clone())
+    }
+
+    async fn save(&self, record: &ProfileRecord) -> Result<(), ProfileStoreError> {
+        *self.record.write().await = record.clone();
+        Ok(())
     }
 }
 
@@ -547,6 +566,7 @@ pub async fn spawn_node(
     let profile = Arc::new(Profile::new(id, FakeKeyStore::derive_fingerprint(&id)));
     let identity = Arc::new(IdentityService::new(
         Arc::clone(&profile),
+        Arc::new(InMemoryProfileStore::default()),
         Arc::clone(&clock),
         bus.clone(),
     ));

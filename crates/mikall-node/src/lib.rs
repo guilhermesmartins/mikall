@@ -8,7 +8,7 @@ use std::sync::Arc;
 use mikall_app::events::{AppEvent, EventBus};
 use mikall_app::ports::{
     BlobStore, CallSignaling, ChatTransport, ChunkHasher, Clock, Directory, FileTransport, IdGen,
-    KeyStore, MediaTransport, MessageStore,
+    KeyStore, MediaTransport, MessageStore, ProfileStore,
 };
 use mikall_app::services::{
     CallService, ChatService, DmService, IdentityService, InboundRouter, PresenceService, Profile,
@@ -91,10 +91,13 @@ pub async fn start(config: NodeConfig) -> Result<NodeHandle, NodeError> {
     let keystore: Arc<dyn KeyStore> = Arc::new(FileKeyStore::new(Arc::clone(&keys)));
     let idgen: Arc<dyn IdGen> = Arc::new(CryptoIdGen);
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let store: Arc<dyn MessageStore> = Arc::new(
+    // One redb database backs both the message log and the profile record.
+    let redb = Arc::new(
         RedbStore::open(&config.data_dir.join("messages.redb"))
             .map_err(|e| NodeError::Store(e.to_string()))?,
     );
+    let store: Arc<dyn MessageStore> = Arc::clone(&redb) as Arc<dyn MessageStore>;
+    let profile_store: Arc<dyn ProfileStore> = redb;
 
     let blobs: Arc<dyn BlobStore> = Arc::new(
         FsBlobStore::new(config.data_dir.join("blobs"))
@@ -114,9 +117,16 @@ pub async fn start(config: NodeConfig) -> Result<NodeHandle, NodeError> {
     let profile = Arc::new(Profile::new(keys.identity_id(), keys.fingerprint()));
     let identity = Arc::new(IdentityService::new(
         Arc::clone(&profile),
+        profile_store,
         Arc::clone(&clock),
         bus.clone(),
     ));
+    // Rehydrate the persisted profile (nickname) so a restarted node keeps
+    // its name and the GUI skips onboarding.
+    identity
+        .hydrate()
+        .await
+        .map_err(|e| NodeError::Store(e.to_string()))?;
     let chat = Arc::new(ChatService::new(
         Arc::clone(&identity),
         Arc::clone(&transport),

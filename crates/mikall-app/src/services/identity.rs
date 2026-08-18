@@ -10,7 +10,7 @@ use mikall_domain::messaging::Nickname;
 use mikall_domain::shared::{Fingerprint, IdentityId};
 
 use crate::events::EventBus;
-use crate::ports::Clock;
+use crate::ports::{Clock, ProfileStore, ProfileStoreError};
 
 /// Shared local profile: who we are and what we know about others.
 #[derive(Debug)]
@@ -54,6 +54,7 @@ pub enum IdentityServiceError {
 #[derive(Clone)]
 pub struct IdentityService {
     profile: Arc<Profile>,
+    store: Arc<dyn ProfileStore>,
     clock: Arc<dyn Clock>,
     bus: EventBus,
 }
@@ -65,12 +66,30 @@ impl std::fmt::Debug for IdentityService {
 }
 
 impl IdentityService {
-    pub fn new(profile: Arc<Profile>, clock: Arc<dyn Clock>, bus: EventBus) -> Self {
+    pub fn new(
+        profile: Arc<Profile>,
+        store: Arc<dyn ProfileStore>,
+        clock: Arc<dyn Clock>,
+        bus: EventBus,
+    ) -> Self {
         IdentityService {
             profile,
+            store,
             clock,
             bus,
         }
+    }
+
+    /// Load the persisted profile record into memory. The composition root
+    /// calls this once at boot, before any frontend attaches — no
+    /// [`IdentityEvent::NicknameChanged`] is published, frontends read the
+    /// result via [`IdentityService::nickname`].
+    pub async fn hydrate(&self) -> Result<(), ProfileStoreError> {
+        let record = self.store.load().await?;
+        if let Some(nick) = record.nickname {
+            *self.profile.nickname.write().await = Some(nick);
+        }
+        Ok(())
     }
 
     pub fn local_id(&self) -> IdentityId {
@@ -83,6 +102,13 @@ impl IdentityService {
 
     pub async fn set_nickname(&self, nickname: Nickname) {
         *self.profile.nickname.write().await = Some(nickname.clone());
+        // Persistence is best-effort: read-modify-write keeps fields this
+        // service doesn't own, and a failed page write never blocks the
+        // rename or its event — the worst outcome is re-onboarding after a
+        // restart, never a wrong nickname.
+        let mut record = self.store.load().await.unwrap_or_default();
+        record.nickname = Some(nickname.clone());
+        let _ = self.store.save(&record).await;
         self.bus
             .publish_domain(IdentityEvent::NicknameChanged { nickname });
     }

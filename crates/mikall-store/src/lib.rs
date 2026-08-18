@@ -5,9 +5,11 @@
 //!   bytes) so a prefix range scan replays a channel in arrival order;
 //!   value = CBOR of [`StoredMessage`].
 //! - `seq`: next sequence number per channel.
+//! - `profile`: a single row (`"local"`) holding the CBOR of
+//!   [`StoredProfile`] — the persisted local profile record.
 //!
-//! Wire/domain types never touch redb directly — [`StoredMessage`] is this
-//! adapter's own serde DTO.
+//! Wire/domain types never touch redb directly — [`StoredMessage`] and
+//! [`StoredProfile`] are this adapter's own serde DTOs.
 
 mod blobs;
 
@@ -20,12 +22,19 @@ use async_trait::async_trait;
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
-use mikall_app::ports::{MessageStore, StoreError, WireMessage};
-use mikall_domain::messaging::{ChannelId, MessageId};
+use mikall_app::ports::{
+    MessageStore, ProfileRecord, ProfileStore, ProfileStoreError, StoreError, WireMessage,
+};
+use mikall_domain::messaging::{ChannelId, MessageId, Nickname};
 use mikall_domain::shared::IdentityId;
 
 const MESSAGES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("messages");
 const SEQ: TableDefinition<&[u8], u64> = TableDefinition::new("seq");
+const PROFILE: TableDefinition<&str, &[u8]> = TableDefinition::new("profile");
+
+/// The single row key of the `profile` table: there is exactly one local
+/// profile per database.
+const PROFILE_KEY: &str = "local";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredMessage {
@@ -63,8 +72,44 @@ impl From<StoredMessage> for WireMessage {
     }
 }
 
+/// This adapter's DTO for the persisted profile. Every field carries
+/// `#[serde(default)]` so records written before a field existed still
+/// decode — the forward-compatibility contract of
+/// [`mikall_app::ports::ProfileRecord`].
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct StoredProfile {
+    #[serde(default)]
+    nickname: Option<String>,
+}
+
+impl From<&ProfileRecord> for StoredProfile {
+    fn from(r: &ProfileRecord) -> Self {
+        StoredProfile {
+            nickname: r.nickname.as_ref().map(|n| n.as_str().to_owned()),
+        }
+    }
+}
+
+impl TryFrom<StoredProfile> for ProfileRecord {
+    type Error = ProfileStoreError;
+
+    fn try_from(s: StoredProfile) -> Result<Self, Self::Error> {
+        let nickname = s
+            .nickname
+            .as_deref()
+            .map(Nickname::parse)
+            .transpose()
+            .map_err(|e| ProfileStoreError::Other(format!("stored nickname invalid: {e}")))?;
+        Ok(ProfileRecord { nickname })
+    }
+}
+
 fn map_err<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Other(e.to_string())
+}
+
+fn map_profile_err<E: std::fmt::Display>(e: E) -> ProfileStoreError {
+    ProfileStoreError::Other(e.to_string())
 }
 
 #[derive(Debug)]
@@ -83,6 +128,7 @@ impl RedbStore {
         {
             tx.open_table(MESSAGES).map_err(map_err)?;
             tx.open_table(SEQ).map_err(map_err)?;
+            tx.open_table(PROFILE).map_err(map_err)?;
         }
         tx.commit().map_err(map_err)?;
         Ok(RedbStore { db: Arc::new(db) })
@@ -155,6 +201,48 @@ impl MessageStore for RedbStore {
     }
 }
 
+#[async_trait]
+impl ProfileStore for RedbStore {
+    async fn load(&self) -> Result<ProfileRecord, ProfileStoreError> {
+        let db = Arc::clone(&self.db);
+        let stored = tokio_free_blocking(move || {
+            let tx = db.begin_read().map_err(map_err)?;
+            let profile = tx.open_table(PROFILE).map_err(map_err)?;
+            match profile.get(PROFILE_KEY).map_err(map_err)? {
+                None => Ok(None),
+                Some(value) => {
+                    let stored: StoredProfile =
+                        ciborium::from_reader(value.value()).map_err(map_err)?;
+                    Ok(Some(stored))
+                }
+            }
+        })
+        .map_err(map_profile_err)?;
+        match stored {
+            None => Ok(ProfileRecord::default()),
+            Some(stored) => ProfileRecord::try_from(stored),
+        }
+    }
+
+    async fn save(&self, record: &ProfileRecord) -> Result<(), ProfileStoreError> {
+        let db = Arc::clone(&self.db);
+        let stored = StoredProfile::from(record);
+        tokio_free_blocking(move || {
+            let tx = db.begin_write().map_err(map_err)?;
+            {
+                let mut profile = tx.open_table(PROFILE).map_err(map_err)?;
+                let mut value = Vec::new();
+                ciborium::into_writer(&stored, &mut value).map_err(map_err)?;
+                profile
+                    .insert(PROFILE_KEY, value.as_slice())
+                    .map_err(map_err)?;
+            }
+            tx.commit().map_err(map_err)
+        })
+        .map_err(map_profile_err)
+    }
+}
+
 /// redb operations are short and synchronous; run them inline. (The name is
 /// a reminder that nothing here awaits or blocks on I/O beyond page writes.)
 fn tokio_free_blocking<T>(f: impl FnOnce() -> Result<T, StoreError>) -> Result<T, StoreError> {
@@ -199,6 +287,64 @@ mod tests {
         assert_eq!(loaded, vec![wire(1), wire(2), wire(3)]);
         let other = store.load_channel_messages(chan_b).await.unwrap();
         assert_eq!(other, vec![wire(9)]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn profile_loads_empty_then_roundtrips_and_survives_reopen() {
+        let dir = std::env::temp_dir().join(format!("mikall-redb-profile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.redb");
+
+        let store = RedbStore::open(&path).unwrap();
+        // A fresh database has no record yet: the default (no nickname).
+        assert_eq!(store.load().await.unwrap(), ProfileRecord::default());
+
+        let record = ProfileRecord {
+            nickname: Some(Nickname::parse("miku").unwrap()),
+        };
+        store.save(&record).await.unwrap();
+        assert_eq!(store.load().await.unwrap(), record);
+
+        // Saving again overwrites the single row rather than appending.
+        let renamed = ProfileRecord {
+            nickname: Some(Nickname::parse("rin").unwrap()),
+        };
+        store.save(&renamed).await.unwrap();
+        assert_eq!(store.load().await.unwrap(), renamed);
+
+        // The restart shape: drop the database handle, reopen the same file.
+        drop(store);
+        let reopened = RedbStore::open(&path).unwrap();
+        assert_eq!(reopened.load().await.unwrap(), renamed);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn profile_and_messages_share_one_database() {
+        let dir = std::env::temp_dir().join(format!("mikall-redb-shared-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = RedbStore::open(&dir.join("test.redb")).unwrap();
+        let chan = ChannelId::from_bytes([0xC; 32]);
+
+        store.save_channel_message(chan, &wire(1)).await.unwrap();
+        store
+            .save(&ProfileRecord {
+                nickname: Some(Nickname::parse("miku").unwrap()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.load_channel_messages(chan).await.unwrap(),
+            vec![wire(1)]
+        );
+        assert_eq!(
+            store.load().await.unwrap().nickname,
+            Some(Nickname::parse("miku").unwrap())
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
