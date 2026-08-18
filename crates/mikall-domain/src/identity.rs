@@ -7,6 +7,7 @@
 
 use core::fmt;
 
+use crate::messaging::Nickname;
 use crate::shared::{Fingerprint, IdentityId};
 
 /// A locally chosen label for a contact. 1..=64 bytes, no control characters.
@@ -162,6 +163,10 @@ impl Contact {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdentityEvent {
+    /// The local profile's announced nickname changed (from any frontend).
+    NicknameChanged {
+        nickname: Nickname,
+    },
     ContactAdded {
         id: IdentityId,
     },
@@ -218,7 +223,8 @@ mod tests {
                 assert_eq!(old_fingerprint, Fingerprint::from_bytes([2; 32]));
                 assert_eq!(new_fingerprint, Fingerprint::from_bytes([9; 32]));
             }
-            IdentityEvent::ContactAdded { .. }
+            IdentityEvent::NicknameChanged { .. }
+            | IdentityEvent::ContactAdded { .. }
             | IdentityEvent::ContactVerified { .. }
             | IdentityEvent::ContactBlocked { .. } => panic!("wrong event"),
         }

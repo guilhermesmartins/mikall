@@ -11,6 +11,7 @@ rust-version.workspace = true
 mikall-domain = { workspace = true }
 mikall-app = { workspace = true }
 mikall-node = { workspace = true }
+mikall-irc = { workspace = true }
 iced = { workspace = true, features = ["tokio", "wgpu", "tiny-skia", "web-colors", "auto-detect-theme"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros"] }
 futures = { workspace = true }

@@ -82,7 +82,9 @@ impl IdentityService {
     }
 
     pub async fn set_nickname(&self, nickname: Nickname) {
-        *self.profile.nickname.write().await = Some(nickname);
+        *self.profile.nickname.write().await = Some(nickname.clone());
+        self.bus
+            .publish_domain(IdentityEvent::NicknameChanged { nickname });
     }
 
     pub async fn nickname(&self) -> Option<Nickname> {

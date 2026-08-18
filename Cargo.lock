@@ -3688,6 +3688,7 @@ dependencies = [
  "iced",
  "mikall-app",
  "mikall-domain",
+ "mikall-irc",
  "mikall-node",
  "tokio",
  "tracing",
