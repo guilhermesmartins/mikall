@@ -6,14 +6,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use mikall_app::events::{AppEvent, EventBus};
-use mikall_app::ports::{ChatTransport, Clock, Directory, IdGen, KeyStore, MessageStore};
+use mikall_app::ports::{
+    BlobStore, ChatTransport, ChunkHasher, Clock, Directory, FileTransport, IdGen, KeyStore,
+    MessageStore,
+};
 use mikall_app::services::{
     CallService, ChatService, DmService, IdentityService, InboundRouter, PresenceService, Profile,
     TransferService,
 };
-use mikall_crypto::{CryptoIdGen, FileKeyStore, LocalKeys, SystemClock};
+use mikall_crypto::{Blake3ChunkHasher, CryptoIdGen, FileKeyStore, LocalKeys, SystemClock};
 use mikall_net::{NetConfig, NetControl, NetStack};
-use mikall_store::RedbStore;
+use mikall_store::{FsBlobStore, RedbStore};
 
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
@@ -91,8 +94,15 @@ pub async fn start(config: NodeConfig) -> Result<NodeHandle, NodeError> {
             .map_err(|e| NodeError::Store(e.to_string()))?,
     );
 
+    let blobs: Arc<dyn BlobStore> = Arc::new(
+        FsBlobStore::new(config.data_dir.join("blobs"))
+            .map_err(|e| NodeError::Store(e.to_string()))?,
+    );
+    let hasher: Arc<dyn ChunkHasher> = Arc::new(Blake3ChunkHasher);
+
     let net = NetStack::build(Arc::clone(&keys), config.net)?;
     let transport: Arc<dyn ChatTransport> = net.transport.clone();
+    let files: Arc<dyn FileTransport> = net.files.clone();
     let directory: Arc<dyn Directory> = net.directory.clone();
     let control = net.control.clone();
 
@@ -132,14 +142,22 @@ pub async fn start(config: NodeConfig) -> Result<NodeHandle, NodeError> {
         Arc::clone(&idgen),
         bus.clone(),
     ));
-    let transfer = Arc::new(TransferService::new(Arc::clone(&idgen), bus.clone()));
+    let transfer = Arc::new(TransferService::new(
+        Arc::clone(&idgen),
+        bus.clone(),
+        files,
+        Arc::clone(&blobs),
+        hasher,
+        config.data_dir.join("downloads"),
+    ));
 
     let router = Arc::new(InboundRouter::new(
         Arc::clone(&chat),
         Arc::clone(&dm),
         Arc::clone(&presence),
+        Arc::clone(&transfer),
     ));
-    let net_task = net.start(router);
+    let net_task = net.start(router, blobs);
 
     Ok(NodeHandle {
         identity,

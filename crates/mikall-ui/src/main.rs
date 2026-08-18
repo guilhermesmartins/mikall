@@ -371,6 +371,10 @@ impl Mikall {
             | AppEvent::Domain(DomainEvent::Messaging(MessagingEvent::ChannelLeft { .. })) => {
                 self.reload_active()
             }
+            AppEvent::TransferSaved { path, .. } => {
+                self.alarm = Some(format!("file saved to {path}"));
+                Task::none()
+            }
             AppEvent::Domain(_) => Task::none(),
         }
     }

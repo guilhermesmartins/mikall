@@ -15,8 +15,9 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 
 use mikall_app::events::{AppEvent, EventBus};
 use mikall_app::ports::{
-    ChannelRecord, ChannelSignal, ChatTransport, Clock, Directory, DirectoryError, IdGen,
-    InboundHandler, KeyStore, KeyStoreError, MessageStore, StoreError, TransportError, WireMessage,
+    BlobStore, ChannelRecord, ChannelSignal, ChatTransport, ChunkHasher, Clock, Directory,
+    DirectoryError, FileTransport, IdGen, InboundHandler, KeyStore, KeyStoreError, MessageStore,
+    StoreError, TransportError, WireMessage,
 };
 use mikall_app::services::{
     CallService, ChatService, DmService, IdentityService, InboundRouter, PresenceService, Profile,
@@ -25,7 +26,7 @@ use mikall_app::services::{
 use mikall_domain::calls::CallId;
 use mikall_domain::messaging::{ChannelId, ChannelName, MessageId, Verified};
 use mikall_domain::shared::{Fingerprint, IdentityId};
-use mikall_domain::transfer::TransferId;
+use mikall_domain::transfer::{BlobHash, FileManifest, TransferId};
 
 fn hash64(parts: &[&[u8]]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -100,6 +101,82 @@ pub struct TestClock {
 impl Clock for TestClock {
     fn now_ms(&self) -> u64 {
         self.now.fetch_add(1, Ordering::Relaxed) + 1_700_000_000_000
+    }
+}
+
+/// In-memory blob store for transfer scenarios.
+type ChunkKey = ([u8; 32], u32);
+
+#[derive(Debug, Default)]
+pub struct InMemoryBlobStore {
+    chunks: RwLock<BTreeMap<ChunkKey, Vec<u8>>>,
+}
+
+#[async_trait]
+impl BlobStore for InMemoryBlobStore {
+    async fn put_chunk(&self, root: BlobHash, index: u32, bytes: &[u8]) -> Result<(), StoreError> {
+        self.chunks
+            .write()
+            .await
+            .insert((*root.as_bytes(), index), bytes.to_vec());
+        Ok(())
+    }
+
+    async fn get_chunk(&self, root: BlobHash, index: u32) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(self
+            .chunks
+            .read()
+            .await
+            .get(&(*root.as_bytes(), index))
+            .cloned())
+    }
+
+    async fn import(&self, _path: &std::path::Path) -> Result<FileManifest, StoreError> {
+        Err(StoreError::Other("no filesystem in BDD scenarios".into()))
+    }
+
+    async fn assemble(
+        &self,
+        _manifest: &FileManifest,
+        _dest: &std::path::Path,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+}
+
+/// No-op file transport: BDD scenarios drive the aggregate directly.
+#[derive(Debug, Default)]
+pub struct NoopFileTransport;
+
+#[async_trait]
+impl FileTransport for NoopFileTransport {
+    async fn send_offer(
+        &self,
+        _to: IdentityId,
+        _manifest: FileManifest,
+    ) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    async fn fetch_chunk(
+        &self,
+        _from: IdentityId,
+        _root: BlobHash,
+        _index: u32,
+    ) -> Result<Vec<u8>, TransportError> {
+        // Scenarios drive chunk verification directly; the background fetch
+        // loop parks here instead of failing the transfer.
+        std::future::pending().await
+    }
+}
+
+/// Deterministic chunk hasher for fakes.
+#[derive(Debug, Default)]
+pub struct TestChunkHasher;
+
+impl ChunkHasher for TestChunkHasher {
+    fn hash_chunk(&self, bytes: &[u8]) -> BlobHash {
+        BlobHash::from_bytes(spread(hash64(&[b"chunk", bytes])))
     }
 }
 
@@ -490,12 +567,20 @@ pub async fn spawn_node(
         Arc::clone(&idgen),
         bus.clone(),
     ));
-    let transfer = Arc::new(TransferService::new(Arc::clone(&idgen), bus.clone()));
+    let transfer = Arc::new(TransferService::new(
+        Arc::clone(&idgen),
+        bus.clone(),
+        Arc::new(NoopFileTransport),
+        Arc::new(InMemoryBlobStore::default()),
+        Arc::new(TestChunkHasher),
+        std::env::temp_dir(),
+    ));
 
     let router = Arc::new(InboundRouter::new(
         Arc::clone(&chat),
         Arc::clone(&dm),
         Arc::clone(&presence),
+        Arc::clone(&transfer),
     ));
     network.register(id, router).await;
 

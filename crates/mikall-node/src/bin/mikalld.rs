@@ -12,6 +12,10 @@
 //!   /members #channel     list members
 //!   /history #channel     print channel history
 //!   /list                 list channels known to the directory
+//!   /send <hex-id> <path> offer a file to an identity
+//!   /transfers            list transfers
+//!   /accept <n>           accept the n-th listed transfer
+//!   /reject <n>           reject the n-th listed transfer
 //!   /away [message]       set or clear away
 //!   /whoami               print identity + fingerprint
 //!   /addr                 print listen addresses
@@ -70,7 +74,13 @@ async fn print_events(node: NodeHandle) {
                     .unwrap_or_else(|| from.to_string());
                 println!("[dm] <{name}> {body}");
             }
+            Ok(AppEvent::TransferSaved { path, .. }) => {
+                println!("[file] saved to {path}");
+            }
             Ok(AppEvent::Domain(event)) => {
+                if let mikall_domain::DomainEvent::Transfer(t) = &event {
+                    println!("[file] {t:?}");
+                }
                 tracing::debug!("domain event: {event:?}");
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -192,6 +202,47 @@ async fn handle_line(node: &NodeHandle, line: &str) -> anyhow::Result<bool> {
             }
             Err(e) => println!("list failed: {e}"),
         },
+        "/send" => {
+            let (target, path) = rest.split_once(' ').unwrap_or((rest, ""));
+            match parse_identity(target) {
+                Some(to) => {
+                    match node
+                        .transfer
+                        .offer_path(to, std::path::Path::new(path))
+                        .await
+                    {
+                        Ok(id) => println!("offered {path} as {id:?}"),
+                        Err(e) => println!("offer failed: {e}"),
+                    }
+                }
+                None => println!("expected a 64-char hex identity"),
+            }
+        }
+        "/transfers" => {
+            for (i, t) in node.transfer.list().await.iter().enumerate() {
+                println!(
+                    "{i}: {:?} {}/{} chunks {:?}",
+                    t.id, t.have_chunks, t.total_chunks, t.phase
+                );
+            }
+        }
+        "/accept" | "/reject" => {
+            let list = node.transfer.list().await;
+            match rest.trim().parse::<usize>().ok().and_then(|i| list.get(i)) {
+                Some(t) => {
+                    let result = if command == "/accept" {
+                        node.transfer.accept(t.id).await
+                    } else {
+                        node.transfer.reject(t.id).await
+                    };
+                    match result {
+                        Ok(()) => println!("{command} ok"),
+                        Err(e) => println!("{command} failed: {e}"),
+                    }
+                }
+                None => println!("usage: {command} <index from /transfers>"),
+            }
+        }
         "/away" => {
             let message = if rest.is_empty() { None } else { Some(rest) };
             match node.presence.set_away(message).await {

@@ -25,6 +25,11 @@ pub enum AppEvent {
         body: MessageBody,
         ts_hint_ms: u64,
     },
+    /// A completed inbound transfer was written to disk.
+    TransferSaved {
+        transfer: mikall_domain::transfer::TransferId,
+        path: String,
+    },
     Domain(DomainEvent),
 }
 

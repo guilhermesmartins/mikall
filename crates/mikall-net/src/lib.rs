@@ -25,14 +25,18 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 use mikall_app::ports::{
-    ChannelRecord, ChannelSignal, ChatTransport, Directory, DirectoryError, InboundHandler,
-    TransportError, WireMessage,
+    BlobStore, ChannelRecord, ChannelSignal, ChatTransport, Directory, DirectoryError,
+    FileTransport, InboundHandler, TransportError, WireMessage,
 };
 use mikall_crypto::LocalKeys;
 use mikall_domain::messaging::{ChannelId, ChannelName};
 use mikall_domain::shared::IdentityId;
+use mikall_domain::transfer::{BlobHash, FileManifest};
 
-use wire::{open_dm, open_envelope, seal_dm, seal_signal, SignedEnvelope, MAX_ENVELOPE_BYTES};
+use wire::{
+    open_dm, open_envelope, seal_dm, seal_offer, seal_signal, DmPayload, SignedEnvelope,
+    MAX_ENVELOPE_BYTES,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum NetError {
@@ -92,6 +96,17 @@ fn decode_record(bytes: &[u8]) -> Option<ChannelRecord> {
 #[derive(Debug, Serialize, Deserialize)]
 struct DmAck;
 
+#[derive(Debug, Serialize, Deserialize)]
+struct BlobRequest {
+    root: Vec<u8>,
+    index: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BlobResponse {
+    chunk: Option<Vec<u8>>,
+}
+
 #[derive(NetworkBehaviour)]
 struct Behaviour {
     gossipsub: gossipsub::Behaviour,
@@ -99,6 +114,7 @@ struct Behaviour {
     mdns: Toggle<mdns::tokio::Behaviour>,
     identify: identify::Behaviour,
     dm: request_response::cbor::Behaviour<SignedEnvelope, DmAck>,
+    blob: request_response::cbor::Behaviour<BlobRequest, BlobResponse>,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +141,8 @@ impl Default for NetConfig {
 
 type DmReply = oneshot::Sender<Result<(), TransportError>>;
 type DmPending = HashMap<request_response::OutboundRequestId, DmReply>;
+type BlobReply = oneshot::Sender<Result<Vec<u8>, TransportError>>;
+type BlobPending = HashMap<request_response::OutboundRequestId, BlobReply>;
 type LookupReply = oneshot::Sender<Result<Option<ChannelRecord>, DirectoryError>>;
 type KadLookups = HashMap<kad::QueryId, (ChannelName, LookupReply)>;
 
@@ -150,6 +168,12 @@ enum Command {
     ListenAddrs(oneshot::Sender<Vec<Multiaddr>>),
     Dial(Multiaddr, oneshot::Sender<Result<(), TransportError>>),
     MeshPeerCount(ChannelId, oneshot::Sender<usize>),
+    SendOffer(
+        IdentityId,
+        Box<FileManifest>,
+        oneshot::Sender<Result<(), TransportError>>,
+    ),
+    FetchChunk(IdentityId, BlobHash, u32, BlobReply),
 }
 
 #[derive(Clone)]
@@ -259,6 +283,47 @@ impl ChatTransport for NetTransport {
     }
 }
 
+/// `FileTransport` implementation over the swarm task.
+pub struct NetFileTransport {
+    tx: CommandSender,
+}
+
+impl std::fmt::Debug for NetFileTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetFileTransport").finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl FileTransport for NetFileTransport {
+    async fn send_offer(
+        &self,
+        to: IdentityId,
+        manifest: FileManifest,
+    ) -> Result<(), TransportError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Command::SendOffer(to, Box::new(manifest), tx))
+            .await?;
+        rx.await
+            .map_err(|_| TransportError::Other("network task is gone".into()))?
+    }
+
+    async fn fetch_chunk(
+        &self,
+        from: IdentityId,
+        root: BlobHash,
+        index: u32,
+    ) -> Result<Vec<u8>, TransportError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Command::FetchChunk(from, root, index, tx))
+            .await?;
+        rx.await
+            .map_err(|_| TransportError::Other("network task is gone".into()))?
+    }
+}
+
 /// `Directory` implementation over Kademlia records.
 pub struct NetDirectory {
     tx: CommandSender,
@@ -309,6 +374,7 @@ impl Directory for NetDirectory {
 pub struct NetStack {
     pub transport: Arc<NetTransport>,
     pub directory: Arc<NetDirectory>,
+    pub files: Arc<NetFileTransport>,
     pub control: NetControl,
     driver: NetDriver,
 }
@@ -388,12 +454,21 @@ impl NetStack {
                     request_response::Config::default(),
                 );
 
+                let blob = request_response::cbor::Behaviour::new(
+                    [(
+                        StreamProtocol::new("/mikall/blob/1"),
+                        request_response::ProtocolSupport::Full,
+                    )],
+                    request_response::Config::default(),
+                );
+
                 Ok(Behaviour {
                     gossipsub,
                     kad,
                     mdns: Toggle::from(mdns),
                     identify,
                     dm,
+                    blob,
                 })
             })
             .map_err(|e| NetError::Build(e.to_string()))?
@@ -413,6 +488,7 @@ impl NetStack {
         Ok(NetStack {
             transport: Arc::new(NetTransport { tx: sender.clone() }),
             directory: Arc::new(NetDirectory { tx: sender.clone() }),
+            files: Arc::new(NetFileTransport { tx: sender.clone() }),
             control: NetControl {
                 tx: sender,
                 local_peer_id,
@@ -426,28 +502,33 @@ impl NetStack {
     }
 
     /// Spawn the swarm event loop, delivering verified inbound traffic to
-    /// `handler`.
-    pub fn start(self, handler: Arc<dyn InboundHandler>) -> tokio::task::JoinHandle<()> {
+    /// `handler` and serving blob-chunk requests from `blobs`.
+    pub fn start(
+        self,
+        handler: Arc<dyn InboundHandler>,
+        blobs: Arc<dyn BlobStore>,
+    ) -> tokio::task::JoinHandle<()> {
         let NetStack { driver, .. } = self;
-        tokio::spawn(driver.run(handler))
+        tokio::spawn(driver.run(handler, blobs))
     }
 }
 
 impl NetDriver {
-    async fn run(mut self, handler: Arc<dyn InboundHandler>) {
+    async fn run(mut self, handler: Arc<dyn InboundHandler>, blobs: Arc<dyn BlobStore>) {
         // channel-id lookup for inbound topics
         let mut topics: HashMap<gossipsub::TopicHash, ChannelId> = HashMap::new();
         let mut dm_pending: DmPending = HashMap::new();
+        let mut blob_pending: BlobPending = HashMap::new();
         let mut kad_lookups: KadLookups = HashMap::new();
 
         loop {
             tokio::select! {
                 command = self.cmd_rx.recv() => {
                     let Some(command) = command else { break };
-                    self.handle_command(command, &mut topics, &mut dm_pending, &mut kad_lookups);
+                    self.handle_command(command, &mut topics, &mut dm_pending, &mut blob_pending, &mut kad_lookups);
                 }
                 event = self.swarm.select_next_some() => {
-                    self.handle_event(event, &topics, &mut dm_pending, &mut kad_lookups, &handler).await;
+                    self.handle_event(event, &topics, &mut dm_pending, &mut blob_pending, &mut kad_lookups, &handler, &blobs).await;
                 }
             }
         }
@@ -458,6 +539,7 @@ impl NetDriver {
         command: Command,
         topics: &mut HashMap<gossipsub::TopicHash, ChannelId>,
         dm_pending: &mut DmPending,
+        blob_pending: &mut BlobPending,
         kad_lookups: &mut KadLookups,
     ) {
         match command {
@@ -562,16 +644,44 @@ impl NetDriver {
                     .count();
                 let _ = reply.send(count);
             }
+            Command::SendOffer(to, manifest, reply) => {
+                let Some(peer) = peer_id_of(&to) else {
+                    let _ = reply.send(Err(TransportError::Other(
+                        "recipient identity is not a valid key".into(),
+                    )));
+                    return;
+                };
+                let envelope = seal_offer(&self.keys, &manifest);
+                let request_id = self.swarm.behaviour_mut().dm.send_request(&peer, envelope);
+                dm_pending.insert(request_id, reply);
+            }
+            Command::FetchChunk(from, root, index, reply) => {
+                let Some(peer) = peer_id_of(&from) else {
+                    let _ = reply.send(Err(TransportError::Other(
+                        "peer identity is not a valid key".into(),
+                    )));
+                    return;
+                };
+                let request = BlobRequest {
+                    root: root.as_bytes().to_vec(),
+                    index,
+                };
+                let request_id = self.swarm.behaviour_mut().blob.send_request(&peer, request);
+                blob_pending.insert(request_id, reply);
+            }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_event(
         &mut self,
         event: SwarmEvent<BehaviourEvent>,
         topics: &HashMap<gossipsub::TopicHash, ChannelId>,
         dm_pending: &mut DmPending,
+        blob_pending: &mut BlobPending,
         kad_lookups: &mut KadLookups,
         handler: &Arc<dyn InboundHandler>,
+        blobs: &Arc<dyn BlobStore>,
     ) {
         match event {
             SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
@@ -604,9 +714,11 @@ impl NetDriver {
                 } => {
                     let _ = self.swarm.behaviour_mut().dm.send_response(channel, DmAck);
                     match open_dm(&request) {
-                        Ok((wire_message, verified)) => {
-                            let from = wire_message.author;
+                        Ok((from, DmPayload::Chat(wire_message), verified)) => {
                             handler.on_dm(from, wire_message, verified).await;
+                        }
+                        Ok((from, DmPayload::Offer(manifest), verified)) => {
+                            handler.on_file_offer(from, manifest, verified).await;
                         }
                         Err(err) => {
                             tracing::debug!("dropping invalid DM envelope: {err}");
@@ -625,6 +737,46 @@ impl NetDriver {
                 },
             )) => {
                 if let Some(reply) = dm_pending.remove(&request_id) {
+                    let _ = reply.send(Err(TransportError::Other(error.to_string())));
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Blob(request_response::Event::Message {
+                message,
+                ..
+            })) => match message {
+                request_response::Message::Request {
+                    request, channel, ..
+                } => {
+                    let chunk = match request.root.as_slice().try_into() {
+                        Ok(root_bytes) => {
+                            let root = BlobHash::from_bytes(root_bytes);
+                            blobs.get_chunk(root, request.index).await.unwrap_or(None)
+                        }
+                        Err(_) => None,
+                    };
+                    let _ = self
+                        .swarm
+                        .behaviour_mut()
+                        .blob
+                        .send_response(channel, BlobResponse { chunk });
+                }
+                request_response::Message::Response {
+                    request_id,
+                    response,
+                } => {
+                    if let Some(reply) = blob_pending.remove(&request_id) {
+                        let _ = reply.send(response.chunk.ok_or_else(|| {
+                            TransportError::Other("peer does not have that chunk".into())
+                        }));
+                    }
+                }
+            },
+            SwarmEvent::Behaviour(BehaviourEvent::Blob(
+                request_response::Event::OutboundFailure {
+                    request_id, error, ..
+                },
+            )) => {
+                if let Some(reply) = blob_pending.remove(&request_id) {
                     let _ = reply.send(Err(TransportError::Other(error.to_string())));
                 }
             }

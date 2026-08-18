@@ -210,6 +210,16 @@ impl KeyStore for FileKeyStore {
     }
 }
 
+/// BLAKE3 chunk hashing for file transfer verification.
+#[derive(Debug, Default)]
+pub struct Blake3ChunkHasher;
+
+impl mikall_app::ports::ChunkHasher for Blake3ChunkHasher {
+    fn hash_chunk(&self, bytes: &[u8]) -> mikall_domain::transfer::BlobHash {
+        mikall_domain::transfer::BlobHash::from_bytes(*blake3::hash(bytes).as_bytes())
+    }
+}
+
 /// Wall-clock milliseconds.
 #[derive(Debug, Default)]
 pub struct SystemClock;

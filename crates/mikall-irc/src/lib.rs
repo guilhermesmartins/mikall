@@ -846,6 +846,12 @@ impl Session {
                     short_id(&id)
                 ));
             }
+            AppEvent::TransferSaved { path, .. } => {
+                self.send(format!(
+                    ":{SERVER_NAME} NOTICE {} :file transfer complete, saved to {path}",
+                    self.my_nick()
+                ));
+            }
             AppEvent::Domain(_) => {}
         }
     }

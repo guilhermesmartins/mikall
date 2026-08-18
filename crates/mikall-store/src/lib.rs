@@ -9,6 +9,10 @@
 //! Wire/domain types never touch redb directly — [`StoredMessage`] is this
 //! adapter's own serde DTO.
 
+mod blobs;
+
+pub use blobs::FsBlobStore;
+
 use std::path::Path;
 use std::sync::Arc;
 

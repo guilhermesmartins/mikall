@@ -89,6 +89,12 @@ pub trait InboundHandler: Send + Sync {
         verified: Verified,
     );
     async fn on_dm(&self, from: IdentityId, message: WireMessage, verified: Verified);
+    async fn on_file_offer(
+        &self,
+        from: IdentityId,
+        manifest: mikall_domain::transfer::FileManifest,
+        verified: Verified,
+    );
 }
 
 /// A channel's discovery record: enough for a stranger to join.
@@ -172,4 +178,53 @@ pub trait IdGen: Send + Sync {
 
 pub trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
+}
+
+/// BLAKE3 chunk hashing (crypto adapter in production).
+pub trait ChunkHasher: Send + Sync {
+    fn hash_chunk(&self, bytes: &[u8]) -> mikall_domain::transfer::BlobHash;
+}
+
+/// Content-addressed chunk storage plus local file import/assembly.
+#[async_trait]
+pub trait BlobStore: Send + Sync {
+    async fn put_chunk(
+        &self,
+        root: mikall_domain::transfer::BlobHash,
+        index: u32,
+        bytes: &[u8],
+    ) -> Result<(), StoreError>;
+    async fn get_chunk(
+        &self,
+        root: mikall_domain::transfer::BlobHash,
+        index: u32,
+    ) -> Result<Option<Vec<u8>>, StoreError>;
+    /// Chunk + hash a local file into the store, returning its manifest.
+    async fn import(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<mikall_domain::transfer::FileManifest, StoreError>;
+    /// Reassemble a completed blob into `dest`.
+    async fn assemble(
+        &self,
+        manifest: &mikall_domain::transfer::FileManifest,
+        dest: &std::path::Path,
+    ) -> Result<(), StoreError>;
+}
+
+/// File-transfer wire operations: offers travel as signed direct envelopes;
+/// chunks are fetched from any peer holding the blob.
+#[async_trait]
+pub trait FileTransport: Send + Sync {
+    async fn send_offer(
+        &self,
+        to: IdentityId,
+        manifest: mikall_domain::transfer::FileManifest,
+    ) -> Result<(), TransportError>;
+    async fn fetch_chunk(
+        &self,
+        from: IdentityId,
+        root: mikall_domain::transfer::BlobHash,
+        index: u32,
+    ) -> Result<Vec<u8>, TransportError>;
 }

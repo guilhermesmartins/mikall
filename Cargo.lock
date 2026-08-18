@@ -3637,6 +3637,7 @@ name = "mikall-store"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "ciborium",
  "mikall-app",
  "mikall-domain",

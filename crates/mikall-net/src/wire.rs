@@ -12,6 +12,7 @@ use mikall_app::ports::{ChannelSignal, WireMessage};
 use mikall_crypto::{derive_message_id, verify_signature, LocalKeys};
 use mikall_domain::messaging::{MessageId, Verified};
 use mikall_domain::shared::IdentityId;
+use mikall_domain::transfer::{BlobHash, FileManifest, FileName};
 
 #[derive(Debug, thiserror::Error)]
 pub enum WireError {
@@ -62,6 +63,54 @@ pub enum SignalDto {
         who: Vec<u8>,
         away: Option<String>,
     },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ManifestDto {
+    pub name: String,
+    pub size: u64,
+    pub root: Vec<u8>,
+    pub chunk_hashes: Vec<Vec<u8>>,
+}
+
+/// Payload of the direct protocol: chat or a file offer.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum DmPayloadDto {
+    Chat(MsgDto),
+    Offer(ManifestDto),
+}
+
+/// Decoded, verified direct payload.
+#[derive(Debug)]
+pub enum DmPayload {
+    Chat(WireMessage),
+    Offer(FileManifest),
+}
+
+fn manifest_dto(manifest: &FileManifest) -> ManifestDto {
+    ManifestDto {
+        name: manifest.name().as_str().to_owned(),
+        size: manifest.size(),
+        root: manifest.root().as_bytes().to_vec(),
+        chunk_hashes: (0..manifest.chunk_count())
+            .filter_map(|i| manifest.chunk_hash(i))
+            .map(|h| h.as_bytes().to_vec())
+            .collect(),
+    }
+}
+
+fn parse_manifest(dto: ManifestDto) -> Result<FileManifest, WireError> {
+    let name = FileName::parse(&dto.name).map_err(|e| WireError::Malformed(e.to_string()))?;
+    let root = BlobHash::from_bytes(to_array32(&dto.root)?);
+    let chunk_hashes = dto
+        .chunk_hashes
+        .iter()
+        .map(|h| to_array32(h).map(BlobHash::from_bytes))
+        .collect::<Result<Vec<_>, _>>()?;
+    // The domain constructor re-checks size/chunk-count invariants, so a
+    // malformed manifest cannot cross this boundary.
+    FileManifest::new(name, dto.size, root, chunk_hashes)
+        .map_err(|e| WireError::Malformed(e.to_string()))
 }
 
 /// A signed envelope as carried on gossip topics and the DM protocol.
@@ -169,7 +218,18 @@ pub fn seal_signal(keys: &LocalKeys, signal: &ChannelSignal) -> SignedEnvelope {
 
 /// Sign a DM into an envelope.
 pub fn seal_dm(keys: &LocalKeys, message: &WireMessage) -> SignedEnvelope {
-    let payload = encode(&msg_dto(message));
+    let payload = encode(&DmPayloadDto::Chat(msg_dto(message)));
+    let sig = keys.sign(&payload);
+    SignedEnvelope {
+        payload,
+        author: keys.identity_id().as_bytes().to_vec(),
+        sig: sig.to_vec(),
+    }
+}
+
+/// Sign a file offer into an envelope.
+pub fn seal_offer(keys: &LocalKeys, manifest: &FileManifest) -> SignedEnvelope {
+    let payload = encode(&DmPayloadDto::Offer(manifest_dto(manifest)));
     let sig = keys.sign(&payload);
     SignedEnvelope {
         payload,
@@ -250,16 +310,23 @@ pub fn open_envelope(envelope: &SignedEnvelope) -> Result<(ChannelSignal, Verifi
     Ok((signal, verified))
 }
 
-/// Verify and decode a DM envelope.
-pub fn open_dm(envelope: &SignedEnvelope) -> Result<(WireMessage, Verified), WireError> {
+/// Verify and decode a direct-protocol envelope (chat or file offer).
+/// Returns the verified author so the caller knows who sent the offer.
+pub fn open_dm(envelope: &SignedEnvelope) -> Result<(IdentityId, DmPayload, Verified), WireError> {
     let (author, verified) = check_signature(envelope)?;
-    let dto: MsgDto = ciborium::from_reader(envelope.payload.as_slice())
+    let dto: DmPayloadDto = ciborium::from_reader(envelope.payload.as_slice())
         .map_err(|e| WireError::Malformed(e.to_string()))?;
-    let message = parse_msg(dto)?;
-    if message.author != author {
-        return Err(WireError::AuthorMismatch);
-    }
-    Ok((message, verified))
+    let payload = match dto {
+        DmPayloadDto::Chat(m) => {
+            let message = parse_msg(m)?;
+            if message.author != author {
+                return Err(WireError::AuthorMismatch);
+            }
+            DmPayload::Chat(message)
+        }
+        DmPayloadDto::Offer(m) => DmPayload::Offer(parse_manifest(m)?),
+    };
+    Ok((author, payload, verified))
 }
 
 #[cfg(test)]
