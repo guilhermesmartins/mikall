@@ -185,6 +185,13 @@ impl IdGen for CryptoIdGen {
     fn transfer_id(&self) -> TransferId {
         TransferId::from_bytes(*uuid::Uuid::now_v7().as_bytes())
     }
+
+    fn call_key(&self) -> [u8; 32] {
+        use rand::RngCore;
+        let mut key = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut key);
+        key
+    }
 }
 
 /// Production `KeyStore` over [`LocalKeys`].

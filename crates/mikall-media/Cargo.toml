@@ -1,0 +1,26 @@
+[package]
+name = "mikall-media"
+description = "Media engine: AEAD-sealed frame protocol, jitter buffer with loss concealment, voice pipeline; cpal/Opus adapters behind the hardware-audio feature."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+## Opus coding via libopus. Mic/speaker capture (cpal) plugs into the
+## same AudioSource/AudioSink ports and needs real hardware to test.
+hardware-audio = ["dep:audiopus"]
+
+[dependencies]
+mikall-domain = { workspace = true }
+mikall-app = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
+tracing = { workspace = true }
+chacha20poly1305 = { workspace = true }
+audiopus = { workspace = true, optional = true }
+
+[lints]
+workspace = true

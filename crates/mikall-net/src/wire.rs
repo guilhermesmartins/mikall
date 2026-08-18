@@ -8,8 +8,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use mikall_app::ports::{ChannelSignal, WireMessage};
+use mikall_app::ports::{CallAction, ChannelSignal, WireMessage};
 use mikall_crypto::{derive_message_id, verify_signature, LocalKeys};
+use mikall_domain::calls::CallId;
 use mikall_domain::messaging::{MessageId, Verified};
 use mikall_domain::shared::IdentityId;
 use mikall_domain::transfer::{BlobHash, FileManifest, FileName};
@@ -73,11 +74,64 @@ pub struct ManifestDto {
     pub chunk_hashes: Vec<Vec<u8>>,
 }
 
-/// Payload of the direct protocol: chat or a file offer.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum CallActionDto {
+    Offer {
+        participants: Vec<Vec<u8>>,
+        media_key: Vec<u8>,
+    },
+    Accept,
+    Decline,
+    HangUp,
+    ScreenShare {
+        active: bool,
+    },
+}
+
+fn call_action_dto(action: &CallAction) -> CallActionDto {
+    match action {
+        CallAction::Offer {
+            participants,
+            media_key,
+        } => CallActionDto::Offer {
+            participants: participants.iter().map(|p| p.as_bytes().to_vec()).collect(),
+            media_key: media_key.to_vec(),
+        },
+        CallAction::Accept => CallActionDto::Accept,
+        CallAction::Decline => CallActionDto::Decline,
+        CallAction::HangUp => CallActionDto::HangUp,
+        CallAction::ScreenShare { active } => CallActionDto::ScreenShare { active: *active },
+    }
+}
+
+fn parse_call_action(dto: CallActionDto) -> Result<CallAction, WireError> {
+    Ok(match dto {
+        CallActionDto::Offer {
+            participants,
+            media_key,
+        } => CallAction::Offer {
+            participants: participants
+                .iter()
+                .map(|p| to_array32(p).map(IdentityId::from_bytes))
+                .collect::<Result<Vec<_>, _>>()?,
+            media_key: to_array32(&media_key)?,
+        },
+        CallActionDto::Accept => CallAction::Accept,
+        CallActionDto::Decline => CallAction::Decline,
+        CallActionDto::HangUp => CallAction::HangUp,
+        CallActionDto::ScreenShare { active } => CallAction::ScreenShare { active },
+    })
+}
+
+/// Payload of the direct protocol: chat, a file offer, or call signaling.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum DmPayloadDto {
     Chat(MsgDto),
     Offer(ManifestDto),
+    Call {
+        call: Vec<u8>,
+        action: CallActionDto,
+    },
 }
 
 /// Decoded, verified direct payload.
@@ -85,6 +139,7 @@ pub enum DmPayloadDto {
 pub enum DmPayload {
     Chat(WireMessage),
     Offer(FileManifest),
+    Call(CallId, CallAction),
 }
 
 fn manifest_dto(manifest: &FileManifest) -> ManifestDto {
@@ -227,6 +282,20 @@ pub fn seal_dm(keys: &LocalKeys, message: &WireMessage) -> SignedEnvelope {
     }
 }
 
+/// Sign a call-signaling action into an envelope.
+pub fn seal_call(keys: &LocalKeys, call: CallId, action: &CallAction) -> SignedEnvelope {
+    let payload = encode(&DmPayloadDto::Call {
+        call: call.as_bytes().to_vec(),
+        action: call_action_dto(action),
+    });
+    let sig = keys.sign(&payload);
+    SignedEnvelope {
+        payload,
+        author: keys.identity_id().as_bytes().to_vec(),
+        sig: sig.to_vec(),
+    }
+}
+
 /// Sign a file offer into an envelope.
 pub fn seal_offer(keys: &LocalKeys, manifest: &FileManifest) -> SignedEnvelope {
     let payload = encode(&DmPayloadDto::Offer(manifest_dto(manifest)));
@@ -325,6 +394,13 @@ pub fn open_dm(envelope: &SignedEnvelope) -> Result<(IdentityId, DmPayload, Veri
             DmPayload::Chat(message)
         }
         DmPayloadDto::Offer(m) => DmPayload::Offer(parse_manifest(m)?),
+        DmPayloadDto::Call { call, action } => {
+            let call_bytes: [u8; 16] = call
+                .as_slice()
+                .try_into()
+                .map_err(|_| WireError::Malformed("expected 16 call-id bytes".into()))?;
+            DmPayload::Call(CallId::from_bytes(call_bytes), parse_call_action(action)?)
+        }
     };
     Ok((author, payload, verified))
 }

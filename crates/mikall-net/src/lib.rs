@@ -25,16 +25,17 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 use mikall_app::ports::{
-    BlobStore, ChannelRecord, ChannelSignal, ChatTransport, Directory, DirectoryError,
-    FileTransport, InboundHandler, TransportError, WireMessage,
+    BlobStore, CallAction, CallSignaling, ChannelRecord, ChannelSignal, ChatTransport, Directory,
+    DirectoryError, FileTransport, InboundHandler, MediaTransport, TransportError, WireMessage,
 };
 use mikall_crypto::LocalKeys;
+use mikall_domain::calls::CallId;
 use mikall_domain::messaging::{ChannelId, ChannelName};
 use mikall_domain::shared::IdentityId;
 use mikall_domain::transfer::{BlobHash, FileManifest};
 
 use wire::{
-    open_dm, open_envelope, seal_dm, seal_offer, seal_signal, DmPayload, SignedEnvelope,
+    open_dm, open_envelope, seal_call, seal_dm, seal_offer, seal_signal, DmPayload, SignedEnvelope,
     MAX_ENVELOPE_BYTES,
 };
 
@@ -51,6 +52,19 @@ pub fn peer_id_of(identity_id: &IdentityId) -> Option<PeerId> {
     identity::ed25519::PublicKey::try_from_bytes(identity_id.as_bytes())
         .ok()
         .map(|pk| PeerId::from_public_key(&identity::PublicKey::from(pk)))
+}
+
+/// Inverse mapping: recover the identity from an Ed25519 `PeerId` (inline
+/// public key). Returns `None` for non-Ed25519 peers.
+pub fn identity_of_peer(peer: &PeerId) -> Option<IdentityId> {
+    let multihash = peer.as_ref();
+    // Identity multihash (code 0x00) wraps the protobuf-encoded public key.
+    if multihash.code() != 0 {
+        return None;
+    }
+    let public = identity::PublicKey::try_decode_protobuf(multihash.digest()).ok()?;
+    let ed = public.try_into_ed25519().ok()?;
+    Some(IdentityId::from_bytes(ed.to_bytes()))
 }
 
 fn topic_of(channel: &ChannelId) -> gossipsub::IdentTopic {
@@ -107,6 +121,15 @@ struct BlobResponse {
     chunk: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct MediaPacket {
+    call: Vec<u8>,
+    frame: Vec<u8>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct MediaAck;
+
 #[derive(NetworkBehaviour)]
 struct Behaviour {
     gossipsub: gossipsub::Behaviour,
@@ -115,6 +138,7 @@ struct Behaviour {
     identify: identify::Behaviour,
     dm: request_response::cbor::Behaviour<SignedEnvelope, DmAck>,
     blob: request_response::cbor::Behaviour<BlobRequest, BlobResponse>,
+    media: request_response::cbor::Behaviour<MediaPacket, MediaAck>,
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +198,13 @@ enum Command {
         oneshot::Sender<Result<(), TransportError>>,
     ),
     FetchChunk(IdentityId, BlobHash, u32, BlobReply),
+    SendCallSignal(
+        IdentityId,
+        CallId,
+        CallAction,
+        oneshot::Sender<Result<(), TransportError>>,
+    ),
+    SendMedia(IdentityId, CallId, Vec<u8>),
 }
 
 #[derive(Clone)]
@@ -324,6 +355,59 @@ impl FileTransport for NetFileTransport {
     }
 }
 
+/// `CallSignaling` implementation over the swarm task.
+pub struct NetCallSignaling {
+    tx: CommandSender,
+}
+
+impl std::fmt::Debug for NetCallSignaling {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetCallSignaling").finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl CallSignaling for NetCallSignaling {
+    async fn send(
+        &self,
+        to: IdentityId,
+        call: CallId,
+        action: CallAction,
+    ) -> Result<(), TransportError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Command::SendCallSignal(to, call, action, tx))
+            .await?;
+        rx.await
+            .map_err(|_| TransportError::Other("network task is gone".into()))?
+    }
+}
+
+/// `MediaTransport` implementation: fire-and-forget sealed frames.
+pub struct NetMediaTransport {
+    tx: CommandSender,
+}
+
+impl std::fmt::Debug for NetMediaTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetMediaTransport").finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl MediaTransport for NetMediaTransport {
+    async fn send_frame(
+        &self,
+        to: IdentityId,
+        call: CallId,
+        sealed_frame: Vec<u8>,
+    ) -> Result<(), TransportError> {
+        self.tx
+            .send(Command::SendMedia(to, call, sealed_frame))
+            .await
+    }
+}
+
 /// `Directory` implementation over Kademlia records.
 pub struct NetDirectory {
     tx: CommandSender,
@@ -375,6 +459,8 @@ pub struct NetStack {
     pub transport: Arc<NetTransport>,
     pub directory: Arc<NetDirectory>,
     pub files: Arc<NetFileTransport>,
+    pub call_signaling: Arc<NetCallSignaling>,
+    pub media: Arc<NetMediaTransport>,
     pub control: NetControl,
     driver: NetDriver,
 }
@@ -462,6 +548,14 @@ impl NetStack {
                     request_response::Config::default(),
                 );
 
+                let media = request_response::cbor::Behaviour::new(
+                    [(
+                        StreamProtocol::new("/mikall/media/1"),
+                        request_response::ProtocolSupport::Full,
+                    )],
+                    request_response::Config::default(),
+                );
+
                 Ok(Behaviour {
                     gossipsub,
                     kad,
@@ -469,6 +563,7 @@ impl NetStack {
                     identify,
                     dm,
                     blob,
+                    media,
                 })
             })
             .map_err(|e| NetError::Build(e.to_string()))?
@@ -489,6 +584,8 @@ impl NetStack {
             transport: Arc::new(NetTransport { tx: sender.clone() }),
             directory: Arc::new(NetDirectory { tx: sender.clone() }),
             files: Arc::new(NetFileTransport { tx: sender.clone() }),
+            call_signaling: Arc::new(NetCallSignaling { tx: sender.clone() }),
+            media: Arc::new(NetMediaTransport { tx: sender.clone() }),
             control: NetControl {
                 tx: sender,
                 local_peer_id,
@@ -655,6 +752,26 @@ impl NetDriver {
                 let request_id = self.swarm.behaviour_mut().dm.send_request(&peer, envelope);
                 dm_pending.insert(request_id, reply);
             }
+            Command::SendCallSignal(to, call, action, reply) => {
+                let Some(peer) = peer_id_of(&to) else {
+                    let _ = reply.send(Err(TransportError::Other(
+                        "recipient identity is not a valid key".into(),
+                    )));
+                    return;
+                };
+                let envelope = seal_call(&self.keys, call, &action);
+                let request_id = self.swarm.behaviour_mut().dm.send_request(&peer, envelope);
+                dm_pending.insert(request_id, reply);
+            }
+            Command::SendMedia(to, call, frame) => {
+                if let Some(peer) = peer_id_of(&to) {
+                    let packet = MediaPacket {
+                        call: call.as_bytes().to_vec(),
+                        frame,
+                    };
+                    let _ = self.swarm.behaviour_mut().media.send_request(&peer, packet);
+                }
+            }
             Command::FetchChunk(from, root, index, reply) => {
                 let Some(peer) = peer_id_of(&from) else {
                     let _ = reply.send(Err(TransportError::Other(
@@ -720,6 +837,9 @@ impl NetDriver {
                         Ok((from, DmPayload::Offer(manifest), verified)) => {
                             handler.on_file_offer(from, manifest, verified).await;
                         }
+                        Ok((from, DmPayload::Call(call, action), verified)) => {
+                            handler.on_call_signal(from, call, action, verified).await;
+                        }
                         Err(err) => {
                             tracing::debug!("dropping invalid DM envelope: {err}");
                         }
@@ -778,6 +898,30 @@ impl NetDriver {
             )) => {
                 if let Some(reply) = blob_pending.remove(&request_id) {
                     let _ = reply.send(Err(TransportError::Other(error.to_string())));
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Media(request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            })) => {
+                let _ = self
+                    .swarm
+                    .behaviour_mut()
+                    .media
+                    .send_response(channel, MediaAck);
+                if let Ok(call_bytes) = <[u8; 16]>::try_from(request.call.as_slice()) {
+                    // Identify the sender by their transport key — the
+                    // PeerId is derived from the identity key, and frame
+                    // authenticity is enforced by the per-call AEAD.
+                    if let Some(from) = identity_of_peer(&peer) {
+                        handler
+                            .on_media_frame(from, CallId::from_bytes(call_bytes), request.frame)
+                            .await;
+                    }
                 }
             }
             SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {

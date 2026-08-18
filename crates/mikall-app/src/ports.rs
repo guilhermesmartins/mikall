@@ -95,6 +95,16 @@ pub trait InboundHandler: Send + Sync {
         manifest: mikall_domain::transfer::FileManifest,
         verified: Verified,
     );
+    async fn on_call_signal(
+        &self,
+        from: IdentityId,
+        call: CallId,
+        action: CallAction,
+        verified: Verified,
+    );
+    /// Sealed media frame for a call. Authenticity comes from the per-call
+    /// AEAD key, not an envelope signature.
+    async fn on_media_frame(&self, from: IdentityId, call: CallId, sealed_frame: Vec<u8>);
 }
 
 /// A channel's discovery record: enough for a stranger to join.
@@ -174,10 +184,53 @@ pub trait IdGen: Send + Sync {
     fn channel_id(&self, name: &ChannelName) -> ChannelId;
     fn call_id(&self) -> CallId;
     fn transfer_id(&self) -> TransferId;
+    /// Fresh random per-call media AEAD key.
+    fn call_key(&self) -> [u8; 32];
 }
 
 pub trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
+}
+
+/// A call-signaling action carried as a signed direct envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallAction {
+    Offer {
+        participants: Vec<IdentityId>,
+        /// Per-call AEAD key for media frames. Confidential to the direct
+        /// Noise-encrypted connection today; moves inside the E2E layer
+        /// with the ratchet upgrade.
+        media_key: [u8; 32],
+    },
+    Accept,
+    Decline,
+    HangUp,
+    ScreenShare {
+        active: bool,
+    },
+}
+
+/// Sends call signaling to a peer (signed direct envelopes in production).
+#[async_trait]
+pub trait CallSignaling: Send + Sync {
+    async fn send(
+        &self,
+        to: IdentityId,
+        call: CallId,
+        action: CallAction,
+    ) -> Result<(), TransportError>;
+}
+
+/// Sends sealed media frames to a call peer. Frames are AEAD-encrypted by
+/// the media engine; the transport only moves bytes.
+#[async_trait]
+pub trait MediaTransport: Send + Sync {
+    async fn send_frame(
+        &self,
+        to: IdentityId,
+        call: CallId,
+        sealed_frame: Vec<u8>,
+    ) -> Result<(), TransportError>;
 }
 
 /// BLAKE3 chunk hashing (crypto adapter in production).

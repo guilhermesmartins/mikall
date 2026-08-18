@@ -25,10 +25,18 @@ recovery), and mikall states them instead of hiding them.
 |---|---|
 | `mikall-domain` | Pure domain core: value objects, aggregates, events. No I/O, no async. |
 | `mikall-app` | Use-case services + the hexagon's ports. |
+| `mikall-crypto` | Ed25519 identity custody, envelope signing, BLAKE3 content ids. |
+| `mikall-net` | libp2p: gossipsub channels, Kademlia directory, mDNS, signed DM/offer/call envelopes, blob + media protocols. |
+| `mikall-store` | redb message store + content-addressed blob store. |
+| `mikall-irc` | The RFC 1459/2812 gateway on loopback (WeeChat/irssi speak to your node). |
+| `mikall-media` | Sealed media frames (ChaCha20-Poly1305), jitter buffer + PLC, voice pipeline; Opus behind `--features hardware-audio`. |
+| `mikall-node` | Composition root (`NodeHandle`) + the `mikalld` headless REPL binary. |
+| `mikall-ui` | The native iced GUI (`mikall` binary), miku_teal theme. |
 | `mikall-bdd` | Cucumber BDD suite + deterministic in-memory multi-node universe. |
 
-Coming per the milestone plan: `mikall-crypto`, `mikall-net`,
-`mikall-store`, `mikall-irc`, `mikall-node`, `mikall-media`, `mikall-ui`.
+Try it on a LAN: run `mikalld` on two machines, `/join #stage` on both, and
+chat — or point WeeChat at `127.0.0.1:6667` with `MIKALL_IRC=6667` set.
+`/send`, `/call`, and `/share` exercise file transfer and call signaling.
 
 ## Developing
 

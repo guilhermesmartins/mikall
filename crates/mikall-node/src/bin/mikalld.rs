@@ -16,6 +16,11 @@
 //!   /transfers            list transfers
 //!   /accept <n>           accept the n-th listed transfer
 //!   /reject <n>           reject the n-th listed transfer
+//!   /call <hex-id>        ring an identity (voice signaling)
+//!   /accept-call <call>   accept an incoming call (32-hex call id)
+//!   /decline-call <call>  decline an incoming call
+//!   /hangup <call>        hang up
+//!   /share <call> on|off  toggle screen-share flag
 //!   /away [message]       set or clear away
 //!   /whoami               print identity + fingerprint
 //!   /addr                 print listen addresses
@@ -41,6 +46,22 @@ fn parse_identity(hex: &str) -> Option<IdentityId> {
         bytes[i] = u8::from_str_radix(s, 16).ok()?;
     }
     Some(IdentityId::from_bytes(bytes))
+}
+
+fn call_hex(id: &mikall_domain::calls::CallId) -> String {
+    id.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn parse_call(hex: &str) -> Option<mikall_domain::calls::CallId> {
+    if hex.len() != 32 {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let s = std::str::from_utf8(chunk).ok()?;
+        bytes[i] = u8::from_str_radix(s, 16).ok()?;
+    }
+    Some(mikall_domain::calls::CallId::from_bytes(bytes))
 }
 
 fn identity_hex(id: &IdentityId) -> String {
@@ -78,8 +99,10 @@ async fn print_events(node: NodeHandle) {
                 println!("[file] saved to {path}");
             }
             Ok(AppEvent::Domain(event)) => {
-                if let mikall_domain::DomainEvent::Transfer(t) = &event {
-                    println!("[file] {t:?}");
+                match &event {
+                    mikall_domain::DomainEvent::Transfer(t) => println!("[file] {t:?}"),
+                    mikall_domain::DomainEvent::Calls(c) => println!("[call] {c:?}"),
+                    _ => {}
                 }
                 tracing::debug!("domain event: {event:?}");
             }
@@ -241,6 +264,44 @@ async fn handle_line(node: &NodeHandle, line: &str) -> anyhow::Result<bool> {
                     }
                 }
                 None => println!("usage: {command} <index from /transfers>"),
+            }
+        }
+        "/call" => match parse_identity(rest) {
+            Some(to) => {
+                let id = node.calls.start_call(vec![to]).await;
+                println!("ringing... call id {}", call_hex(&id));
+            }
+            None => println!("expected a 64-char hex identity"),
+        },
+        "/accept-call" => match parse_call(rest) {
+            Some(id) => match node.calls.accept_incoming(id).await {
+                Ok(()) => println!("call accepted"),
+                Err(e) => println!("accept failed: {e}"),
+            },
+            None => println!("expected a 32-char hex call id"),
+        },
+        "/decline-call" => match parse_call(rest) {
+            Some(id) => match node.calls.decline_incoming(id).await {
+                Ok(()) => println!("call declined"),
+                Err(e) => println!("decline failed: {e}"),
+            },
+            None => println!("expected a 32-char hex call id"),
+        },
+        "/hangup" => match parse_call(rest) {
+            Some(id) => match node.calls.hang_up_all(id).await {
+                Ok(()) => println!("hung up"),
+                Err(e) => println!("hangup failed: {e}"),
+            },
+            None => println!("expected a 32-char hex call id"),
+        },
+        "/share" => {
+            let (call, state) = rest.split_once(' ').unwrap_or((rest, "on"));
+            match parse_call(call) {
+                Some(id) => match node.calls.share_screen(id, state == "on").await {
+                    Ok(()) => println!("screen share {state}"),
+                    Err(e) => println!("share failed: {e}"),
+                },
+                None => println!("expected a 32-char hex call id"),
             }
         }
         "/away" => {

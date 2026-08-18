@@ -15,9 +15,9 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 
 use mikall_app::events::{AppEvent, EventBus};
 use mikall_app::ports::{
-    BlobStore, ChannelRecord, ChannelSignal, ChatTransport, ChunkHasher, Clock, Directory,
-    DirectoryError, FileTransport, IdGen, InboundHandler, KeyStore, KeyStoreError, MessageStore,
-    StoreError, TransportError, WireMessage,
+    BlobStore, CallAction, CallSignaling, ChannelRecord, ChannelSignal, ChatTransport, ChunkHasher,
+    Clock, Directory, DirectoryError, FileTransport, IdGen, InboundHandler, KeyStore,
+    KeyStoreError, MessageStore, StoreError, TransportError, WireMessage,
 };
 use mikall_app::services::{
     CallService, ChatService, DmService, IdentityService, InboundRouter, PresenceService, Profile,
@@ -89,6 +89,10 @@ impl IdGen for TestIdGen {
         bytes[..8].copy_from_slice(&n.to_le_bytes());
         bytes[8] = 0x54; // tag transfer ids apart from call ids
         TransferId::from_bytes(bytes)
+    }
+
+    fn call_key(&self) -> [u8; 32] {
+        [0x4B; 32]
     }
 }
 
@@ -167,6 +171,22 @@ impl FileTransport for NoopFileTransport {
         // Scenarios drive chunk verification directly; the background fetch
         // loop parks here instead of failing the transfer.
         std::future::pending().await
+    }
+}
+
+/// No-op call signaling: BDD scenarios drive the aggregate directly.
+#[derive(Debug, Default)]
+pub struct NoopCallSignaling;
+
+#[async_trait]
+impl CallSignaling for NoopCallSignaling {
+    async fn send(
+        &self,
+        _to: IdentityId,
+        _call: CallId,
+        _action: CallAction,
+    ) -> Result<(), TransportError> {
+        Ok(())
     }
 }
 
@@ -565,6 +585,7 @@ pub async fn spawn_node(
     let calls = Arc::new(CallService::new(
         Arc::clone(&identity),
         Arc::clone(&idgen),
+        Arc::new(NoopCallSignaling),
         bus.clone(),
     ));
     let transfer = Arc::new(TransferService::new(
@@ -581,6 +602,7 @@ pub async fn spawn_node(
         Arc::clone(&dm),
         Arc::clone(&presence),
         Arc::clone(&transfer),
+        Arc::clone(&calls),
     ));
     network.register(id, router).await;
 

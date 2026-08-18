@@ -1,17 +1,18 @@
-//! Call use cases. In M0–M4 this drives the `Call` aggregate (signaling and
-//! media transports arrive with the media milestone); the mesh-size
-//! invariant and the call lifecycle are fully enforced here already.
+//! Call use cases: the `Call` aggregate driven by signed signaling
+//! envelopes between peers. Media frames are routed to per-call taps for
+//! the media engine; the mesh-size invariant and lifecycle live in the
+//! domain aggregate.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 
-use mikall_domain::calls::{Call, CallError, CallId, CallPhase, MediaState};
+use mikall_domain::calls::{Call, CallError, CallEvent, CallId, CallPhase, MediaState};
 use mikall_domain::shared::IdentityId;
 
 use crate::events::EventBus;
-use crate::ports::IdGen;
+use crate::ports::{CallAction, CallSignaling, IdGen, TransportError};
 
 use super::identity::IdentityService;
 
@@ -21,6 +22,8 @@ pub enum CallServiceError {
     UnknownCall,
     #[error(transparent)]
     Call(#[from] CallError),
+    #[error(transparent)]
+    Transport(#[from] TransportError),
 }
 
 /// Read-model of a call for frontends.
@@ -32,12 +35,17 @@ pub struct CallSnapshot {
     pub participants: Vec<(IdentityId, MediaState)>,
 }
 
+type MediaTap = mpsc::Sender<(IdentityId, Vec<u8>)>;
+
 #[derive(Clone)]
 pub struct CallService {
     identity: Arc<IdentityService>,
     idgen: Arc<dyn IdGen>,
+    signaling: Arc<dyn CallSignaling>,
     bus: EventBus,
     calls: Arc<RwLock<BTreeMap<CallId, Call>>>,
+    media_taps: Arc<RwLock<BTreeMap<CallId, MediaTap>>>,
+    call_keys: Arc<RwLock<BTreeMap<CallId, [u8; 32]>>>,
 }
 
 impl std::fmt::Debug for CallService {
@@ -47,22 +55,224 @@ impl std::fmt::Debug for CallService {
 }
 
 impl CallService {
-    pub fn new(identity: Arc<IdentityService>, idgen: Arc<dyn IdGen>, bus: EventBus) -> Self {
+    pub fn new(
+        identity: Arc<IdentityService>,
+        idgen: Arc<dyn IdGen>,
+        signaling: Arc<dyn CallSignaling>,
+        bus: EventBus,
+    ) -> Self {
         CallService {
             identity,
             idgen,
+            signaling,
             bus,
             calls: Arc::new(RwLock::new(BTreeMap::new())),
+            media_taps: Arc::new(RwLock::new(BTreeMap::new())),
+            call_keys: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
+    /// Ring one or more peers. The mesh cap (8) is enforced by the roster
+    /// as participants actually join.
     pub async fn start_call(&self, offered_to: Vec<IdentityId>) -> CallId {
         let id = self.idgen.call_id();
-        let (call, event) = Call::offer(id, self.identity.local_id(), offered_to);
+        let me = self.identity.local_id();
+        let media_key = self.idgen.call_key();
+        let (call, event) = Call::offer(id, me, offered_to.clone());
         self.calls.write().await.insert(id, call);
+        self.call_keys.write().await.insert(id, media_key);
         self.bus.publish_domain(event);
+        for peer in offered_to {
+            let _ = self
+                .signaling
+                .send(
+                    peer,
+                    id,
+                    CallAction::Offer {
+                        participants: vec![me],
+                        media_key,
+                    },
+                )
+                .await;
+        }
         id
     }
+
+    /// The AEAD key protecting this call's media frames.
+    pub async fn media_key(&self, id: CallId) -> Option<[u8; 32]> {
+        self.call_keys.read().await.get(&id).copied()
+    }
+
+    /// Accept a call that was offered to us.
+    pub async fn accept_incoming(&self, id: CallId) -> Result<(), CallServiceError> {
+        let me = self.identity.local_id();
+        let (events, initiator) = {
+            let mut calls = self.calls.write().await;
+            let call = calls.get_mut(&id).ok_or(CallServiceError::UnknownCall)?;
+            let events = call.accept(me)?;
+            call.connected()?;
+            (events, call.initiator())
+        };
+        for event in events {
+            self.bus.publish_domain(event);
+        }
+        self.signaling
+            .send(initiator, id, CallAction::Accept)
+            .await?;
+        Ok(())
+    }
+
+    /// Decline a call that was offered to us.
+    pub async fn decline_incoming(&self, id: CallId) -> Result<(), CallServiceError> {
+        let me = self.identity.local_id();
+        let (events, initiator) = {
+            let mut calls = self.calls.write().await;
+            let call = calls.get_mut(&id).ok_or(CallServiceError::UnknownCall)?;
+            let initiator = call.initiator();
+            (call.decline(me)?, initiator)
+        };
+        for event in events {
+            self.bus.publish_domain(event);
+        }
+        self.signaling
+            .send(initiator, id, CallAction::Decline)
+            .await?;
+        Ok(())
+    }
+
+    /// Hang up: end locally and tell every other participant.
+    pub async fn hang_up_all(&self, id: CallId) -> Result<(), CallServiceError> {
+        let me = self.identity.local_id();
+        let (event, peers) = {
+            let mut calls = self.calls.write().await;
+            let call = calls.get_mut(&id).ok_or(CallServiceError::UnknownCall)?;
+            let peers: Vec<IdentityId> = call
+                .roster()
+                .members()
+                .map(|(who, _)| who)
+                .filter(|who| *who != me)
+                .collect();
+            (call.hang_up()?, peers)
+        };
+        self.bus.publish_domain(event);
+        self.media_taps.write().await.remove(&id);
+        for peer in peers {
+            let _ = self.signaling.send(peer, id, CallAction::HangUp).await;
+        }
+        Ok(())
+    }
+
+    /// Toggle our screen share and tell the call.
+    pub async fn share_screen(&self, id: CallId, active: bool) -> Result<(), CallServiceError> {
+        let me = self.identity.local_id();
+        let (event, peers) = {
+            let mut calls = self.calls.write().await;
+            let call = calls.get_mut(&id).ok_or(CallServiceError::UnknownCall)?;
+            let peers: Vec<IdentityId> = call
+                .roster()
+                .members()
+                .map(|(who, _)| who)
+                .filter(|who| *who != me)
+                .collect();
+            (call.set_screen_sharing(me, active)?, peers)
+        };
+        self.bus.publish_domain(event);
+        for peer in peers {
+            let _ = self
+                .signaling
+                .send(peer, id, CallAction::ScreenShare { active })
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Inbound signaling from the router (envelope already verified).
+    pub async fn receive_signal(&self, from: IdentityId, id: CallId, action: CallAction) {
+        let mut events: Vec<CallEvent> = Vec::new();
+        {
+            let mut calls = self.calls.write().await;
+            match action {
+                CallAction::Offer { media_key, .. } => {
+                    if let std::collections::btree_map::Entry::Vacant(entry) = calls.entry(id) {
+                        let me = self.identity.local_id();
+                        let (call, event) = Call::offer(id, from, vec![me]);
+                        entry.insert(call);
+                        self.call_keys.write().await.insert(id, media_key);
+                        events.push(event);
+                    }
+                }
+                CallAction::Accept => {
+                    if let Some(call) = calls.get_mut(&id) {
+                        if let Ok(mut accepted) = call.accept(from) {
+                            events.append(&mut accepted);
+                            let _ = call.connected();
+                        }
+                    }
+                }
+                CallAction::Decline => {
+                    if let Some(call) = calls.get_mut(&id) {
+                        if let Ok(mut declined) = call.decline(from) {
+                            events.append(&mut declined);
+                        }
+                    }
+                }
+                CallAction::HangUp => {
+                    if let Some(call) = calls.get_mut(&id) {
+                        match call.leave(from) {
+                            Ok(mut left) => events.append(&mut left),
+                            Err(_) => {
+                                if let Ok(event) = call.hang_up() {
+                                    events.push(event);
+                                }
+                            }
+                        }
+                    }
+                    self.media_taps.write().await.remove(&id);
+                }
+                CallAction::ScreenShare { active } => {
+                    if let Some(call) = calls.get_mut(&id) {
+                        if let Ok(event) = call.set_screen_sharing(from, active) {
+                            events.push(event);
+                        }
+                    }
+                }
+            }
+        }
+        for event in events {
+            self.bus.publish_domain(event);
+        }
+    }
+
+    /// The media engine registers here to receive this call's inbound
+    /// sealed frames.
+    pub async fn media_tap(&self, id: CallId) -> mpsc::Receiver<(IdentityId, Vec<u8>)> {
+        let (tx, rx) = mpsc::channel(256);
+        self.media_taps.write().await.insert(id, tx);
+        rx
+    }
+
+    /// Inbound sealed media frame from the router.
+    pub async fn receive_media(&self, from: IdentityId, id: CallId, sealed_frame: Vec<u8>) {
+        let tap = self.media_taps.read().await.get(&id).cloned();
+        if let Some(tap) = tap {
+            let _ = tap.try_send((from, sealed_frame));
+        }
+    }
+
+    /// Peers to send media to (everyone in the roster but us).
+    pub async fn media_peers(&self, id: CallId) -> Result<Vec<IdentityId>, CallServiceError> {
+        let me = self.identity.local_id();
+        let calls = self.calls.read().await;
+        let call = calls.get(&id).ok_or(CallServiceError::UnknownCall)?;
+        Ok(call
+            .roster()
+            .members()
+            .map(|(who, _)| who)
+            .filter(|who| *who != me)
+            .collect())
+    }
+
+    // ------ direct aggregate drivers (BDD + local flows) ------
 
     pub async fn accept(&self, id: CallId, by: IdentityId) -> Result<(), CallServiceError> {
         let events = {

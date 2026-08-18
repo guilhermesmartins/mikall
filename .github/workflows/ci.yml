@@ -46,6 +46,17 @@ jobs:
       - name: Unit, property, and BDD tests
         run: cargo test --workspace
 
+  media-hardware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install libopus
+        run: sudo apt-get update && sudo apt-get install -y libopus-dev
+      - name: Opus codec tests
+        run: cargo test -p mikall-media --features hardware-audio
+
   deny:
     runs-on: ubuntu-latest
     steps:

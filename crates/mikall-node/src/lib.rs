@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use mikall_app::events::{AppEvent, EventBus};
 use mikall_app::ports::{
-    BlobStore, ChatTransport, ChunkHasher, Clock, Directory, FileTransport, IdGen, KeyStore,
-    MessageStore,
+    BlobStore, CallSignaling, ChatTransport, ChunkHasher, Clock, Directory, FileTransport, IdGen,
+    KeyStore, MediaTransport, MessageStore,
 };
 use mikall_app::services::{
     CallService, ChatService, DmService, IdentityService, InboundRouter, PresenceService, Profile,
@@ -56,6 +56,8 @@ pub struct NodeHandle {
     pub transfer: Arc<TransferService>,
     pub bus: EventBus,
     pub net: NetControl,
+    /// Sends sealed media frames to call peers (used by the media engine).
+    pub media: Arc<dyn MediaTransport>,
     net_task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
@@ -103,6 +105,8 @@ pub async fn start(config: NodeConfig) -> Result<NodeHandle, NodeError> {
     let net = NetStack::build(Arc::clone(&keys), config.net)?;
     let transport: Arc<dyn ChatTransport> = net.transport.clone();
     let files: Arc<dyn FileTransport> = net.files.clone();
+    let call_signaling: Arc<dyn CallSignaling> = net.call_signaling.clone();
+    let media: Arc<dyn MediaTransport> = net.media.clone();
     let directory: Arc<dyn Directory> = net.directory.clone();
     let control = net.control.clone();
 
@@ -140,6 +144,7 @@ pub async fn start(config: NodeConfig) -> Result<NodeHandle, NodeError> {
     let calls = Arc::new(CallService::new(
         Arc::clone(&identity),
         Arc::clone(&idgen),
+        call_signaling,
         bus.clone(),
     ));
     let transfer = Arc::new(TransferService::new(
@@ -156,6 +161,7 @@ pub async fn start(config: NodeConfig) -> Result<NodeHandle, NodeError> {
         Arc::clone(&dm),
         Arc::clone(&presence),
         Arc::clone(&transfer),
+        Arc::clone(&calls),
     ));
     let net_task = net.start(router, blobs);
 
@@ -168,6 +174,7 @@ pub async fn start(config: NodeConfig) -> Result<NodeHandle, NodeError> {
         transfer,
         bus,
         net: control,
+        media,
         net_task: Arc::new(std::sync::Mutex::new(Some(net_task))),
     })
 }
