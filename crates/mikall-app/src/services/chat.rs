@@ -388,7 +388,8 @@ impl ChatService {
             .ok_or_else(|| ChatError::NotJoined(name.as_str().to_owned()))
     }
 
-    async fn name_of(&self, channel: ChannelId) -> Option<ChannelName> {
+    /// Reverse lookup of a joined channel's name.
+    pub async fn name_of(&self, channel: ChannelId) -> Option<ChannelName> {
         self.by_name
             .read()
             .await

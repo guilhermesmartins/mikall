@@ -13,6 +13,7 @@ mikall-app = { workspace = true }
 mikall-crypto = { workspace = true }
 mikall-net = { workspace = true }
 mikall-store = { workspace = true }
+mikall-irc = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "io-std", "io-util", "time", "signal"] }
@@ -22,6 +23,12 @@ libp2p = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
+cucumber = { workspace = true }
+futures = { workspace = true }
+
+[[test]]
+name = "irc_bdd"
+harness = false
 
 [[bin]]
 name = "mikalld"

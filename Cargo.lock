@@ -2293,6 +2293,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mikall-irc"
+version = "0.1.0"
+dependencies = [
+ "mikall-app",
+ "mikall-domain",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "mikall-net"
 version = "0.1.0"
 dependencies = [
@@ -2315,10 +2326,13 @@ name = "mikall-node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cucumber",
+ "futures",
  "libp2p",
  "mikall-app",
  "mikall-crypto",
  "mikall-domain",
+ "mikall-irc",
  "mikall-net",
  "mikall-store",
  "thiserror 2.0.20",

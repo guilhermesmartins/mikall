@@ -233,6 +233,30 @@ async fn main() -> anyhow::Result<()> {
     println!("fingerprint: {}", node.identity.fingerprint());
     println!("type /join #channel to begin; /quit to exit");
 
+    // Optional loopback IRC gateway: MIKALL_IRC=<port> [MIKALL_IRC_PASS=..]
+    if let Ok(port) = std::env::var("MIKALL_IRC") {
+        match port.parse::<u16>() {
+            Ok(port) => {
+                let services = mikall_irc::GatewayServices {
+                    identity: node.identity.clone(),
+                    chat: node.chat.clone(),
+                    dm: node.dm.clone(),
+                    presence: node.presence.clone(),
+                    bus: node.bus.clone(),
+                };
+                let config = mikall_irc::IrcConfig {
+                    bind: mikall_irc::IrcBindAddr::localhost(port),
+                    password: std::env::var("MIKALL_IRC_PASS").ok(),
+                };
+                match mikall_irc::serve(services, config).await {
+                    Ok((addr, _task)) => println!("IRC gateway on {addr} (loopback only)"),
+                    Err(e) => println!("IRC gateway failed to start: {e}"),
+                }
+            }
+            Err(_) => println!("MIKALL_IRC must be a port number"),
+        }
+    }
+
     tokio::spawn(print_events(node.clone()));
 
     let stdin = BufReader::new(tokio::io::stdin());

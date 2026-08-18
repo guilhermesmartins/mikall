@@ -97,6 +97,19 @@ impl IdentityService {
         self.profile.nicks.read().await.get(id).cloned()
     }
 
+    /// Reverse lookup: the identity that most recently announced `nick`.
+    /// Nicknames are labels, not identities — collisions resolve to the
+    /// first match in id order, and `WHOIS` shows the fingerprint.
+    pub async fn identity_by_nickname(&self, nick: &str) -> Option<IdentityId> {
+        self.profile
+            .nicks
+            .read()
+            .await
+            .iter()
+            .find(|(_, n)| n.as_str().eq_ignore_ascii_case(nick))
+            .map(|(id, _)| *id)
+    }
+
     /// Record a sighting of a peer: TOFU-pin on first contact, raise the
     /// key-change alarm when the fingerprint differs from the pinned one.
     pub async fn observe_peer(

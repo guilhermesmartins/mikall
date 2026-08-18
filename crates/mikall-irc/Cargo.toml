@@ -1,0 +1,18 @@
+[package]
+name = "mikall-irc"
+description = "Driving adapter: an RFC 1459/2812 IRC server gateway on loopback, so standard IRC clients drive the same node the GUI does."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mikall-domain = { workspace = true }
+mikall-app = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util", "rt", "sync", "macros", "time"] }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

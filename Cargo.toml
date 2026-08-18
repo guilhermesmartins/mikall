@@ -8,6 +8,7 @@ members = [
     "crates/mikall-net",
     "crates/mikall-store",
     "crates/mikall-node",
+    "crates/mikall-irc",
 ]
 
 [workspace.package]
@@ -24,6 +25,7 @@ mikall-crypto = { path = "crates/mikall-crypto" }
 mikall-net = { path = "crates/mikall-net" }
 mikall-store = { path = "crates/mikall-store" }
 mikall-node = { path = "crates/mikall-node" }
+mikall-irc = { path = "crates/mikall-irc" }
 
 thiserror = "2"
 async-trait = "0.1"
