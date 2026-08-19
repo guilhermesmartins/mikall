@@ -202,6 +202,11 @@ enum Msg {
     IrcSave,
     OpenSettings,
     CloseSettings,
+    ListenAddrsLoaded(Vec<String>),
+    DialInput(String),
+    DialSubmit,
+    Dialed(Result<String, String>),
+    CopyText(String),
     BlockedLoaded(Vec<(IdentityId, Option<Nickname>)>),
     Unblock(IdentityId),
     CopyKeyPath,
@@ -262,6 +267,10 @@ struct Mikall {
     join_input: String,
     show_roster: bool,
     alarm: Option<Alarm>,
+    /// Our libp2p listen addresses — shown in settings → network so a peer
+    /// can dial us out of band when mDNS discovery is unavailable.
+    listen_addrs: Vec<String>,
+    dial_input: String,
     call: Option<CallUi>,
     /// Incoming offers that rang while another call surface was up; the
     /// next one is shown when the current call ends or is dismissed.
@@ -303,6 +312,8 @@ impl Mikall {
             join_input: String::new(),
             show_roster: true,
             alarm: None,
+            listen_addrs: Vec::new(),
+            dial_input: String::new(),
             call: None,
             call_backlog: Vec::new(),
             ring_glow: false,
@@ -372,6 +383,23 @@ impl Mikall {
                 move |messages| Msg::HistoryLoaded(key.clone(), messages),
             ),
         }
+    }
+
+    fn load_listen_addrs(&self) -> Task<Msg> {
+        let Some(node) = self.node() else {
+            return Task::none();
+        };
+        Task::perform(
+            async move {
+                node.net
+                    .listen_addrs()
+                    .await
+                    .into_iter()
+                    .map(|a| a.to_string())
+                    .collect()
+            },
+            Msg::ListenAddrsLoaded,
+        )
     }
 
     fn load_channels(&self) -> Task<Msg> {
@@ -581,7 +609,7 @@ impl Mikall {
                     async move { identity_cfg.irc_config().await },
                     Msg::IrcConfigLoaded,
                 );
-                Task::batch([nick, self.load_channels(), irc])
+                Task::batch([nick, self.load_channels(), irc, self.load_listen_addrs()])
             }
             Msg::Booted(Err(error)) => {
                 self.screen = Screen::Failed(error);
@@ -727,12 +755,55 @@ impl Mikall {
                     pass_input: self.irc_cfg.password.clone().unwrap_or_default(),
                     export_armed: false,
                 });
-                self.load_blocked()
+                Task::batch([self.load_blocked(), self.load_listen_addrs()])
             }
             Msg::CloseSettings => {
                 self.settings = None;
                 Task::none()
             }
+            Msg::ListenAddrsLoaded(addrs) => {
+                self.listen_addrs = addrs;
+                Task::none()
+            }
+            Msg::DialInput(value) => {
+                self.dial_input = value;
+                Task::none()
+            }
+            Msg::DialSubmit => {
+                let raw = self.dial_input.trim().to_owned();
+                let Some(node) = self.node() else {
+                    return Task::none();
+                };
+                if raw.is_empty() {
+                    return Task::none();
+                }
+                self.dial_input.clear();
+                Task::perform(
+                    async move {
+                        let addr = raw.parse().map_err(|e| format!("{e}"))?;
+                        node.net
+                            .dial(addr)
+                            .await
+                            .map(|()| raw)
+                            .map_err(|e| e.to_string())
+                    },
+                    Msg::Dialed,
+                )
+            }
+            Msg::Dialed(Ok(addr)) => {
+                self.alarm = Some(Alarm::Info {
+                    body: format!("connected — dialed {addr}"),
+                });
+                Task::none()
+            }
+            Msg::Dialed(Err(error)) => {
+                self.alarm = Some(Alarm::Danger {
+                    title: "DIAL FAILED",
+                    body: error,
+                });
+                Task::none()
+            }
+            Msg::CopyText(value) => iced::clipboard::write(value),
             Msg::BlockedLoaded(blocked) => {
                 self.blocked = blocked;
                 Task::none()
@@ -1928,6 +1999,11 @@ impl Mikall {
                     text("channels are IRC-style #names — joining a name no one holds founds it")
                         .size(13)
                         .color(theme::MUTED),
+                    Space::with_height(4),
+                    text("alone on the network? settings → network shows your address and dials a peer")
+                        .size(11)
+                        .font(MONO)
+                        .color(theme::MUTED),
                 ]
                 .spacing(8)
                 .align_x(iced::Center),
@@ -1966,14 +2042,35 @@ impl Mikall {
                 Target::Channel(_) => self.members.iter().any(|m| Some(m.id) != me),
             };
 
+        let call_button = button(text("call").size(11).font(MONO))
+            .style(theme::ghost)
+            .padding([3, 10])
+            .on_press_maybe(can_call.then_some(Msg::CallStart));
+        // A dead control with no explanation is a lie of omission: when the
+        // button can't work, hovering says why.
+        let call_button: Element<'_, Msg> = if can_call {
+            call_button.into()
+        } else {
+            let reason = if self.call_in_progress() {
+                "a call is already up — hang up first"
+            } else {
+                "no one else is here to call — connect a peer in settings → network"
+            };
+            tooltip(
+                call_button,
+                container(text(reason).size(11))
+                    .style(theme::card)
+                    .padding([4, 8]),
+                tooltip::Position::Bottom,
+            )
+            .into()
+        };
+
         let topic_bar = container(
             row![
                 text(title).size(15).font(MONO_BOLD).color(theme::TEAL),
                 text(&self.topic).size(13).color(theme::MUTED).width(Fill),
-                button(text("call").size(11).font(MONO))
-                    .style(theme::ghost)
-                    .padding([3, 10])
-                    .on_press_maybe(can_call.then_some(Msg::CallStart)),
+                call_button,
                 button(
                     text(if self.show_roster {
                         "roster »"
@@ -2147,6 +2244,7 @@ impl Mikall {
             header,
             self.view_settings_identity(settings),
             self.view_settings_gateway(settings),
+            self.view_settings_network(),
             Self::view_settings_privacy(),
             self.view_settings_blocklist(),
         ]
@@ -2371,6 +2469,76 @@ impl Mikall {
     }
 
     /// Brief §3.5: the static honesty block, stated plainly (§5 voice).
+    /// Settings → network: our dialable addresses and a manual dial input.
+    /// On a serverless network this IS the connectivity story when mDNS
+    /// discovery is unavailable (e.g. macOS local-network permission).
+    fn view_settings_network(&self) -> Element<'_, Msg> {
+        let mut addrs = Column::new().spacing(3);
+        if self.listen_addrs.is_empty() {
+            addrs = addrs.push(
+                text("no listen addresses yet — the node may still be starting")
+                    .size(11)
+                    .font(MONO)
+                    .color(theme::MUTED),
+            );
+        }
+        for addr in &self.listen_addrs {
+            addrs = addrs.push(
+                row![
+                    text(addr.clone()).size(11).font(MONO).width(Fill),
+                    button(text("copy").size(10).font(MONO))
+                        .style(theme::ghost)
+                        .padding([2, 8])
+                        .on_press(Msg::CopyText(addr.clone())),
+                ]
+                .spacing(8)
+                .align_y(iced::Center),
+            );
+        }
+
+        let dial = row![
+            text_input("/ip4/…/udp/…/quic-v1 — a peer's address", &self.dial_input)
+                .on_input(Msg::DialInput)
+                .on_submit(Msg::DialSubmit)
+                .style(theme::input)
+                .font(MONO)
+                .padding(8)
+                .size(12),
+            button(text("connect").size(11).font(MONO))
+                .style(theme::ghost)
+                .padding([8, 14])
+                .on_press(Msg::DialSubmit),
+        ]
+        .spacing(8)
+        .align_y(iced::Center);
+
+        container(
+            column![
+                text("NETWORK").size(10).font(MONO).color(theme::TEAL),
+                Space::with_height(6),
+                text("your addresses — share one out of band; a friend dials it to reach you")
+                    .size(12)
+                    .color(theme::MUTED),
+                addrs,
+                Space::with_height(10),
+                text("connect to a peer").size(12).color(theme::MUTED),
+                dial,
+                text(
+                    "lan discovery uses mdns — on macos, allow local network for this app. \
+                     once connected, join the same #channel on both nodes."
+                )
+                .size(11)
+                .font(MONO)
+                .color(theme::MUTED),
+            ]
+            .spacing(6),
+        )
+        .style(theme::card)
+        .padding([16, 20])
+        .width(Fill)
+        .into()
+    }
+
     fn view_settings_privacy() -> Element<'static, Msg> {
         container(
             column![
