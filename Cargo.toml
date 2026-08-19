@@ -63,3 +63,21 @@ missing_debug_implementations = "warn"
 [workspace.lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
+
+# Media hot paths must run at full speed even in `cargo run` dev builds:
+# software H.264 at -O0 cannot hold a 100 ms frame budget, so sharing in a
+# debug build lags unusably without these.
+[profile.dev.package.openh264]
+opt-level = 3
+[profile.dev.package.openh264-sys2]
+opt-level = 3
+[profile.dev.package.scap]
+opt-level = 3
+[profile.dev.package.mikall-media]
+opt-level = 3
+[profile.dev.package.audiopus]
+opt-level = 3
+[profile.dev.package.audiopus_sys]
+opt-level = 3
+[profile.dev.package.cpal]
+opt-level = 3
