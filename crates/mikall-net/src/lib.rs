@@ -191,6 +191,7 @@ enum Command {
     ListChannels(oneshot::Sender<Vec<ChannelRecord>>),
     ListenAddrs(oneshot::Sender<Vec<Multiaddr>>),
     Dial(Multiaddr, oneshot::Sender<Result<(), TransportError>>),
+    ConnectedPeers(oneshot::Sender<Vec<PeerId>>),
     MeshPeerCount(ChannelId, oneshot::Sender<usize>),
     SendOffer(
         IdentityId,
@@ -248,6 +249,17 @@ impl NetControl {
         self.tx.send(Command::Dial(addr, tx)).await?;
         rx.await
             .map_err(|_| TransportError::Other("network task is gone".into()))?
+    }
+
+    /// Peers with at least one live connection right now. Lets callers
+    /// (the boot redial task, network status surfaces) distinguish "dial
+    /// initiated" — all [`NetControl::dial`] promises — from "connected".
+    pub async fn connected_peers(&self) -> Vec<PeerId> {
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(Command::ConnectedPeers(tx)).await.is_err() {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
     }
 
     pub async fn mesh_peer_count(&self, channel: ChannelId) -> usize {
@@ -730,6 +742,10 @@ impl NetDriver {
                     .dial(addr)
                     .map_err(|e| TransportError::Other(e.to_string()));
                 let _ = reply.send(result);
+            }
+            Command::ConnectedPeers(reply) => {
+                let peers: Vec<PeerId> = self.swarm.connected_peers().copied().collect();
+                let _ = reply.send(peers);
             }
             Command::MeshPeerCount(channel, reply) => {
                 let topic = topic_of(&channel);

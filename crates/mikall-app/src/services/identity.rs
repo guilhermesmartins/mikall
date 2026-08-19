@@ -10,7 +10,7 @@ use mikall_domain::messaging::Nickname;
 use mikall_domain::shared::{Fingerprint, IdentityId};
 
 use crate::events::EventBus;
-use crate::ports::{Clock, IrcGatewayConfig, ProfileStore, ProfileStoreError};
+use crate::ports::{Clock, IrcGatewayConfig, PeerAddr, ProfileStore, ProfileStoreError};
 
 /// Shared local profile: who we are and what we know about others.
 #[derive(Debug)]
@@ -146,6 +146,35 @@ impl IdentityService {
         let mut record = self.store.load().await.unwrap_or_default();
         record.irc = Some(config);
         let _ = self.store.save(&record).await;
+    }
+
+    /// Remember a peer address we successfully connected to, so the node
+    /// redials it automatically at the next boot — after the first manual
+    /// dial, connecting costs zero ongoing effort. Deduped (a known
+    /// address moves to the front), capped at
+    /// [`crate::ports::ProfileRecord::PEERS_CAP`] most-recent entries,
+    /// persisted best-effort via read-modify-write like every profile
+    /// write in this service.
+    pub async fn remember_peer(&self, addr: PeerAddr) {
+        let mut record = self.store.load().await.unwrap_or_default();
+        record.remember_peer(addr);
+        let _ = self.store.save(&record).await;
+    }
+
+    /// Drop a remembered peer address; boot stops redialing it. A no-op
+    /// (and no write) when the address was never remembered.
+    pub async fn forget_peer(&self, addr: &PeerAddr) {
+        let mut record = self.store.load().await.unwrap_or_default();
+        if record.forget_peer(addr) {
+            let _ = self.store.save(&record).await;
+        }
+    }
+
+    /// The remembered peer addresses, most recent first — the boot redial
+    /// list and the settings "saved peers" surface. Best-effort like every
+    /// profile read: an unreadable record answers with an empty list.
+    pub async fn known_peers(&self) -> Vec<PeerAddr> {
+        self.store.load().await.unwrap_or_default().peers
     }
 
     /// The label we display for an identity: their announced nickname.

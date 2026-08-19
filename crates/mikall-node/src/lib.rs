@@ -58,7 +58,9 @@ pub struct NodeHandle {
     pub net: NetControl,
     /// Sends sealed media frames to call peers (used by the media engine).
     pub media: Arc<dyn MediaTransport>,
-    net_task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Background tasks owned by this node: the swarm loop and the boot
+    /// redial of remembered peers. All aborted on shutdown.
+    tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl std::fmt::Debug for NodeHandle {
@@ -72,11 +74,12 @@ impl NodeHandle {
         self.bus.subscribe()
     }
 
-    /// Stop the network task and release the node's resources (key file,
-    /// database lock). Required before re-opening the same data directory.
+    /// Stop the background tasks and release the node's resources (key
+    /// file, database lock). Required before re-opening the same data
+    /// directory.
     pub fn shutdown(&self) {
-        if let Ok(mut guard) = self.net_task.lock() {
-            if let Some(task) = guard.take() {
+        if let Ok(mut guard) = self.tasks.lock() {
+            for task in guard.drain(..) {
                 task.abort();
             }
         }
@@ -174,6 +177,14 @@ pub async fn start(config: NodeConfig) -> Result<NodeHandle, NodeError> {
         Arc::clone(&calls),
     ));
     let net_task = net.start(router, blobs);
+    // Redial remembered peers in the background: with mDNS often blocked
+    // (macOS local-network permission), this is what makes connecting
+    // automatic from the second boot on — for every frontend, with zero
+    // UI involvement. Failures are quiet and the task ends on its own.
+    let redial_task = tokio::spawn(redial_remembered_peers(
+        Arc::clone(&identity),
+        control.clone(),
+    ));
 
     Ok(NodeHandle {
         identity,
@@ -185,6 +196,72 @@ pub async fn start(config: NodeConfig) -> Result<NodeHandle, NodeError> {
         bus,
         net: control,
         media,
-        net_task: Arc::new(std::sync::Mutex::new(Some(net_task))),
+        tasks: Arc::new(std::sync::Mutex::new(vec![net_task, redial_task])),
     })
+}
+
+/// Dial every remembered peer with a short, bounded retry: three rounds, a
+/// few seconds apart, then the task ends — a dead peer must never spam the
+/// log forever. [`NetControl::dial`] only promises "dial initiated", so
+/// each round after the first consults [`NetControl::connected_peers`] and
+/// drops targets that made it; addresses without a `/p2p/` suffix cannot
+/// be correlated with a connection and get a single round. All outcomes
+/// are non-fatal; per-dial chatter stays at debug with one info summary.
+async fn redial_remembered_peers(identity: Arc<IdentityService>, net: NetControl) {
+    use libp2p::multiaddr::Protocol;
+    use libp2p::{Multiaddr, PeerId};
+
+    const ROUNDS: u32 = 3;
+    const BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+    let remembered = identity.known_peers().await;
+    if remembered.is_empty() {
+        return;
+    }
+
+    let mut targets: Vec<(Multiaddr, Option<PeerId>)> = Vec::new();
+    for addr in &remembered {
+        match addr.as_str().parse::<Multiaddr>() {
+            Ok(multiaddr) => {
+                let peer = multiaddr.iter().find_map(|p| match p {
+                    Protocol::P2p(peer) => Some(peer),
+                    _ => None,
+                });
+                targets.push((multiaddr, peer));
+            }
+            Err(error) => {
+                tracing::debug!(addr = addr.as_str(), %error, "skipping unparseable remembered peer");
+            }
+        }
+    }
+    let wanted: Vec<PeerId> = targets.iter().filter_map(|(_, peer)| *peer).collect();
+
+    for round in 1..=ROUNDS {
+        if round > 1 {
+            tokio::time::sleep(BASE_DELAY * 2u32.pow(round - 2)).await;
+            let connected = net.connected_peers().await;
+            targets.retain(|(_, peer)| peer.is_some_and(|p| !connected.contains(&p)));
+        }
+        if targets.is_empty() {
+            break;
+        }
+        for (addr, _) in &targets {
+            match net.dial(addr.clone()).await {
+                Ok(()) => tracing::debug!(%addr, round, "redialing remembered peer"),
+                Err(error) => {
+                    tracing::debug!(%addr, round, %error, "remembered peer dial failed");
+                }
+            }
+        }
+    }
+
+    // One summary line once the dust settles, then the task is done.
+    tokio::time::sleep(BASE_DELAY).await;
+    let connected = net.connected_peers().await;
+    let reconnected = wanted.iter().filter(|p| connected.contains(p)).count();
+    tracing::info!(
+        reconnected,
+        remembered = remembered.len(),
+        "boot redial of remembered peers finished"
+    );
 }

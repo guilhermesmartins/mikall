@@ -23,8 +23,8 @@ use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 use mikall_app::ports::{
-    GatewayPort, IrcGatewayConfig, MessageStore, ProfileRecord, ProfileStore, ProfileStoreError,
-    StoreError, WireMessage,
+    GatewayPort, IrcGatewayConfig, MessageStore, PeerAddr, ProfileRecord, ProfileStore,
+    ProfileStoreError, StoreError, WireMessage,
 };
 use mikall_domain::messaging::{ChannelId, MessageId, Nickname};
 use mikall_domain::shared::IdentityId;
@@ -85,6 +85,9 @@ struct StoredProfile {
     irc: Option<StoredIrcGateway>,
     #[serde(default)]
     blocked: Vec<[u8; 32]>,
+    /// Remembered peer multiaddrs, most recent first.
+    #[serde(default)]
+    peers: Vec<String>,
 }
 
 /// The IRC-gateway slice of [`StoredProfile`], mirroring
@@ -109,6 +112,7 @@ impl From<&ProfileRecord> for StoredProfile {
                 password: irc.password.clone(),
             }),
             blocked: r.blocked.iter().map(|id| *id.as_bytes()).collect(),
+            peers: r.peers.iter().map(|p| p.as_str().to_owned()).collect(),
         }
     }
 }
@@ -135,10 +139,25 @@ impl TryFrom<StoredProfile> for ProfileRecord {
                 })
             })
             .transpose()?;
+        // The peer cache is best-effort by nature: an entry this build
+        // cannot parse (written by another version, or hand-edited) is
+        // dropped rather than failing the whole profile load. Dedupe and
+        // the cap are re-asserted so every reader sees the invariant even
+        // if the file was tampered with.
+        let mut peers = Vec::new();
+        for stored in s.peers {
+            if let Ok(addr) = PeerAddr::parse(&stored) {
+                if !peers.contains(&addr) {
+                    peers.push(addr);
+                }
+            }
+        }
+        peers.truncate(ProfileRecord::PEERS_CAP);
         Ok(ProfileRecord {
             nickname,
             irc,
             blocked: s.blocked.into_iter().map(IdentityId::from_bytes).collect(),
+            peers,
         })
     }
 }
@@ -404,6 +423,62 @@ mod tests {
         assert_eq!(loaded.blocked, vec![IdentityId::from_bytes([7; 32])]);
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn remembered_peers_roundtrip_and_survive_reopen() {
+        let dir = std::env::temp_dir().join(format!("mikall-redb-peers-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.redb");
+
+        let store = RedbStore::open(&path).unwrap();
+        // A record written before the field existed decodes with no peers.
+        store
+            .save(&ProfileRecord {
+                nickname: Some(Nickname::parse("miku").unwrap()),
+                ..ProfileRecord::default()
+            })
+            .await
+            .unwrap();
+        assert!(store.load().await.unwrap().peers.is_empty());
+
+        // Read-modify-write keeps the nickname while remembering peers.
+        let mut record = store.load().await.unwrap();
+        record.remember_peer(
+            PeerAddr::parse("/ip4/192.168.1.7/tcp/4001/p2p/12D3KooWQvcGm").unwrap(),
+        );
+        record.remember_peer(PeerAddr::parse("/ip4/10.0.0.9/udp/4001/quic-v1").unwrap());
+        store.save(&record).await.unwrap();
+
+        drop(store);
+        let reopened = RedbStore::open(&path).unwrap();
+        let loaded = reopened.load().await.unwrap();
+        assert_eq!(loaded.nickname, Some(Nickname::parse("miku").unwrap()));
+        // Most-recent-first order survives the round trip.
+        assert_eq!(loaded.peers, record.peers);
+        assert_eq!(
+            loaded.peers[0].as_str(),
+            "/ip4/10.0.0.9/udp/4001/quic-v1"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unparseable_stored_peers_are_dropped_not_fatal() {
+        // A future (or tampered) file may hold entries this build cannot
+        // parse; the cache drops them instead of bricking the profile.
+        let stored = StoredProfile {
+            peers: vec![
+                "/ip4/1.2.3.4/tcp/4001".to_owned(),
+                "not-a-multiaddr".to_owned(),
+                "/ip4/1.2.3.4/tcp/4001".to_owned(),
+            ],
+            ..StoredProfile::default()
+        };
+        let record = ProfileRecord::try_from(stored).unwrap();
+        assert_eq!(record.peers.len(), 1);
+        assert_eq!(record.peers[0].as_str(), "/ip4/1.2.3.4/tcp/4001");
     }
 
     #[tokio::test]

@@ -206,6 +206,66 @@ pub struct IrcGatewayConfig {
     pub password: Option<String>,
 }
 
+/// A remembered peer's multiaddr, held as a validated string. The port
+/// layer speaks no libp2p, so validation is syntactic — leading slash,
+/// non-empty `/`-separated segments, no whitespace, bounded length — and
+/// the network adapter does the real parse at dial time. Anything that
+/// passes here round-trips the store safely and displays cleanly in a
+/// saved-peers list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerAddr(String);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PeerAddrError {
+    #[error("peer address is empty")]
+    Empty,
+    #[error("peer address must be a multiaddr starting with '/'")]
+    NotAMultiaddr,
+    #[error("peer address has an empty '/'-separated segment")]
+    EmptySegment,
+    #[error("peer address contains whitespace or control characters")]
+    ForbiddenCharacter,
+    #[error("peer address is longer than {} bytes", PeerAddr::MAX_LEN)]
+    TooLong,
+}
+
+impl PeerAddr {
+    /// Generous for any TCP/QUIC multiaddr with a `/p2p/` suffix, small
+    /// enough that a persisted record stays bounded.
+    pub const MAX_LEN: usize = 256;
+
+    /// Smart constructor: trims, then checks multiaddr syntax.
+    pub fn parse(s: &str) -> Result<Self, PeerAddrError> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err(PeerAddrError::Empty);
+        }
+        if s.len() > Self::MAX_LEN {
+            return Err(PeerAddrError::TooLong);
+        }
+        let Some(rest) = s.strip_prefix('/') else {
+            return Err(PeerAddrError::NotAMultiaddr);
+        };
+        if s.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(PeerAddrError::ForbiddenCharacter);
+        }
+        if rest.split('/').any(str::is_empty) {
+            return Err(PeerAddrError::EmptySegment);
+        }
+        Ok(PeerAddr(s.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for PeerAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// The locally persisted slice of the profile. Every field is `Option` +
 /// `Default` (or an empty collection) so later milestones add fields here
 /// without changing the [`ProfileStore`] trait and without invalidating
@@ -219,6 +279,33 @@ pub struct ProfileRecord {
     /// Locally blocked identities — bans are local on a decentralized
     /// network, and they survive a restart.
     pub blocked: Vec<IdentityId>,
+    /// Addresses of peers we successfully connected to — most recent
+    /// first, deduped, capped at [`ProfileRecord::PEERS_CAP`]. The node
+    /// redials these at boot, so a manual dial is a first-time-only act.
+    pub peers: Vec<PeerAddr>,
+}
+
+impl ProfileRecord {
+    /// How many remembered peers survive: the most recent 16. The cache
+    /// exists to make reconnection automatic, not to archive every peer
+    /// ever met, so it must never grow unbounded.
+    pub const PEERS_CAP: usize = 16;
+
+    /// Remember a peer address: a known one moves to the front, a new one
+    /// is inserted there, and the oldest past the cap falls off.
+    pub fn remember_peer(&mut self, addr: PeerAddr) {
+        self.peers.retain(|known| known != &addr);
+        self.peers.insert(0, addr);
+        self.peers.truncate(Self::PEERS_CAP);
+    }
+
+    /// Forget a peer address. Returns whether the record changed (and so
+    /// wants persisting).
+    pub fn forget_peer(&mut self, addr: &PeerAddr) -> bool {
+        let before = self.peers.len();
+        self.peers.retain(|known| known != addr);
+        self.peers.len() != before
+    }
 }
 
 /// Local persistence of the profile record (redb in production). Callers
@@ -381,9 +468,80 @@ mod tests {
         assert_eq!(record.nickname, None);
         assert_eq!(record.irc, None);
         assert!(record.blocked.is_empty());
+        assert!(record.peers.is_empty());
         let irc = IrcGatewayConfig::default();
         assert!(!irc.enabled);
         assert_eq!(irc.port.get(), 6667);
         assert_eq!(irc.password, None);
+    }
+
+    #[test]
+    fn peer_addr_parses_multiaddrs_and_rejects_junk() {
+        // Whitespace around a pasted address is forgiven, junk is not.
+        let ok = PeerAddr::parse(" /ip4/127.0.0.1/tcp/4001 ").unwrap();
+        assert_eq!(ok.as_str(), "/ip4/127.0.0.1/tcp/4001");
+        assert!(PeerAddr::parse("/ip4/192.168.1.7/udp/4001/quic-v1/p2p/12D3KooWQvcGm").is_ok());
+
+        assert_eq!(PeerAddr::parse(""), Err(PeerAddrError::Empty));
+        assert_eq!(PeerAddr::parse("   "), Err(PeerAddrError::Empty));
+        assert_eq!(
+            PeerAddr::parse("localhost:4001"),
+            Err(PeerAddrError::NotAMultiaddr)
+        );
+        assert_eq!(
+            PeerAddr::parse("/ip4//tcp/4001"),
+            Err(PeerAddrError::EmptySegment)
+        );
+        assert_eq!(
+            PeerAddr::parse("/ip4/1.2.3.4/tcp/4001/"),
+            Err(PeerAddrError::EmptySegment)
+        );
+        assert_eq!(PeerAddr::parse("/"), Err(PeerAddrError::EmptySegment));
+        assert_eq!(
+            PeerAddr::parse("/ip4/1.2.3.4 evil/tcp/4001"),
+            Err(PeerAddrError::ForbiddenCharacter)
+        );
+        let long = format!("/dns4/{}/tcp/4001", "a".repeat(PeerAddr::MAX_LEN));
+        assert_eq!(PeerAddr::parse(&long), Err(PeerAddrError::TooLong));
+    }
+
+    #[test]
+    fn remember_peer_dedupes_moves_to_front_and_caps() {
+        let addr = |s: &str| PeerAddr::parse(s).unwrap();
+        let mut record = ProfileRecord::default();
+        let first = addr("/ip4/10.0.0.1/tcp/4001");
+        let second = addr("/ip4/10.0.0.2/tcp/4001");
+
+        record.remember_peer(first.clone());
+        record.remember_peer(second.clone());
+        assert_eq!(record.peers, vec![second.clone(), first.clone()]);
+
+        // Re-remembering moves to the front instead of duplicating.
+        record.remember_peer(first.clone());
+        assert_eq!(record.peers, vec![first, second]);
+
+        // Only the most recent PEERS_CAP survive.
+        for port in 0..40 {
+            record.remember_peer(addr(&format!("/ip4/10.9.9.9/tcp/{port}")));
+        }
+        assert_eq!(record.peers.len(), ProfileRecord::PEERS_CAP);
+        assert_eq!(record.peers[0].as_str(), "/ip4/10.9.9.9/tcp/39");
+        assert_eq!(
+            record.peers[ProfileRecord::PEERS_CAP - 1].as_str(),
+            "/ip4/10.9.9.9/tcp/24"
+        );
+    }
+
+    #[test]
+    fn forget_peer_reports_whether_the_record_changed() {
+        let mut record = ProfileRecord::default();
+        let known = PeerAddr::parse("/ip4/10.0.0.1/tcp/4001").unwrap();
+        let stranger = PeerAddr::parse("/ip4/10.0.0.2/tcp/4001").unwrap();
+        record.remember_peer(known.clone());
+
+        assert!(!record.forget_peer(&stranger));
+        assert!(record.forget_peer(&known));
+        assert!(!record.forget_peer(&known));
+        assert!(record.peers.is_empty());
     }
 }
