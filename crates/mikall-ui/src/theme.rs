@@ -114,6 +114,95 @@ pub fn alarm_info(_: &Theme) -> container::Style {
     }
 }
 
+/// The docked call strip while a call is ringing (either direction): a
+/// teal wash whose edge pulses gently between two alphas (brief §2 motion).
+pub fn call_ringing(glow: bool) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(TEAL_DIM.into()),
+        border: Border {
+            color: Color {
+                a: if glow { 0.55 } else { 0.22 },
+                ..TEAL
+            },
+            width: 1.0,
+            radius: border::radius(0),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// The docked call strip while connecting, active, or ended.
+pub fn call_panel(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(SURFACE.into()),
+        border: Border {
+            color: HAIRLINE,
+            width: 1.0,
+            radius: border::radius(0),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// A participant tile in the call grid (max 8 — the domain's mesh cap).
+pub fn call_tile(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(SURFACE_2.into()),
+        border: Border {
+            color: HAIRLINE,
+            width: 1.0,
+            radius: border::radius(8),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// Media-state chip on a call tile ("mic off", "deafened").
+pub fn chip_danger(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(DANGER_DIM.into()),
+        text_color: Some(DANGER),
+        border: Border {
+            color: Color { a: 0.35, ..DANGER },
+            width: 1.0,
+            radius: border::radius(4),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// Destructive fill: hang up.
+pub fn danger(_: &Theme, status: button::Status) -> button::Style {
+    let fill = match status {
+        button::Status::Hovered | button::Status::Pressed => Color::from_rgb(1.0, 0.45, 0.62),
+        button::Status::Active | button::Status::Disabled => DANGER,
+    };
+    button::Style {
+        background: Some(fill.into()),
+        text_color: INK_ON_PINK,
+        border: Border {
+            radius: border::radius(6),
+            ..Border::default()
+        },
+        ..button::Style::default()
+    }
+}
+
+/// Destructive outline: decline an offer, cancel an outgoing ring.
+pub fn danger_outline(_: &Theme, status: button::Status) -> button::Style {
+    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    button::Style {
+        background: hovered.then(|| DANGER_DIM.into()),
+        text_color: DANGER,
+        border: Border {
+            color: Color { a: 0.5, ..DANGER },
+            width: 1.0,
+            radius: border::radius(6),
+        },
+        ..button::Style::default()
+    }
+}
+
 /// The pink unread-count pill.
 pub fn badge(_: &Theme) -> container::Style {
     container::Style {

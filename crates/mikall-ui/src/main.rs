@@ -10,6 +10,7 @@ mod theme;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use iced::widget::{
     button, column, container, row, scrollable, text, text_input, tooltip, Column, Row, Space,
@@ -17,7 +18,8 @@ use iced::widget::{
 use iced::{Element, Fill, Font, Subscription, Task};
 
 use mikall_app::events::AppEvent;
-use mikall_app::services::{MemberView, RenderedMessage};
+use mikall_app::services::{CallSnapshot, MemberView, RenderedMessage};
+use mikall_domain::calls::{CallEvent, CallId, CallPhase, CallRoster, EndReason, MediaState};
 use mikall_domain::identity::IdentityEvent;
 use mikall_domain::messaging::{ChannelName, MessagingEvent, Nickname, Role};
 use mikall_domain::presence::PresenceState;
@@ -97,6 +99,17 @@ enum Alarm {
     Info { body: String },
 }
 
+/// The call surface: one call shown at a time, offers that arrive while it
+/// is up wait in `Mikall::call_backlog`. `snapshot` is the service's
+/// read-model, refetched on every call event — the UI never mutates call
+/// state locally, so it can never disagree with the aggregate. `None` means
+/// the first fetch is still in flight (nothing is rendered yet).
+#[derive(Debug)]
+struct CallUi {
+    id: CallId,
+    snapshot: Option<CallSnapshot>,
+}
+
 #[derive(Debug, Clone)]
 enum Msg {
     Booted(Result<NodeHandle, String>),
@@ -120,6 +133,15 @@ enum Msg {
     Sent(Result<(), String>),
     ToggleRoster,
     DismissAlarm,
+    CallStart,
+    CallStarted(CallId),
+    CallAccept(CallId),
+    CallDecline(CallId),
+    CallHangUp(CallId),
+    CallDone(Result<(), String>),
+    CallSnapshot(Result<CallSnapshot, String>),
+    CallDismiss,
+    RingPulse,
     Noop,
 }
 
@@ -140,6 +162,12 @@ struct Mikall {
     join_input: String,
     show_roster: bool,
     alarm: Option<Alarm>,
+    call: Option<CallUi>,
+    /// Incoming offers that rang while another call surface was up; the
+    /// next one is shown when the current call ends or is dismissed.
+    call_backlog: Vec<CallId>,
+    /// Alternates while ringing to drive the strip's gentle edge pulse.
+    ring_glow: bool,
 }
 
 impl Mikall {
@@ -161,6 +189,9 @@ impl Mikall {
             join_input: String::new(),
             show_roster: true,
             alarm: None,
+            call: None,
+            call_backlog: Vec::new(),
+            ring_glow: false,
         };
         let task = Task::perform(
             async {
@@ -288,6 +319,85 @@ impl Mikall {
             },
             Msg::PresenceLoaded,
         )
+    }
+
+    /// A call surface is up and not yet ended — the topic-bar call button
+    /// stays disabled and new offers queue behind it.
+    fn call_in_progress(&self) -> bool {
+        self.call.as_ref().is_some_and(|call| {
+            call.snapshot
+                .as_ref()
+                .is_none_or(|s| !matches!(s.phase, CallPhase::Ended { .. }))
+        })
+    }
+
+    fn call_is_ringing(&self) -> bool {
+        self.call
+            .as_ref()
+            .and_then(|call| call.snapshot.as_ref())
+            .is_some_and(|s| matches!(s.phase, CallPhase::Ringing { .. }))
+    }
+
+    /// Refetch the service's read-model of this call.
+    fn refresh_call(&self, id: CallId) -> Task<Msg> {
+        let Some(node) = self.node() else {
+            return Task::none();
+        };
+        Task::perform(
+            async move { node.calls.snapshot(id).await.map_err(|e| e.to_string()) },
+            Msg::CallSnapshot,
+        )
+    }
+
+    /// Surface the oldest queued incoming offer, if the slot is free.
+    fn show_next_offer(&mut self) -> Task<Msg> {
+        if self.call.is_some() || self.call_backlog.is_empty() {
+            return Task::none();
+        }
+        let id = self.call_backlog.remove(0);
+        self.call = Some(CallUi { id, snapshot: None });
+        self.refresh_call(id)
+    }
+
+    /// Nick if any surface knows one (active-channel roster, DM list, our
+    /// own profile), else the shortened identity hex. The bool means
+    /// "render monospace" — hex is identity material.
+    fn peer_label(&self, id: IdentityId) -> (String, bool) {
+        if self.me() == Some(id) {
+            if let Some(nick) = &self.nickname {
+                return (nick.clone(), false);
+            }
+        }
+        if let Some(nick) = self
+            .members
+            .iter()
+            .find(|m| m.id == id)
+            .and_then(|m| m.nick.as_ref())
+        {
+            return (nick.as_str().to_owned(), false);
+        }
+        if let Some(nick) = self
+            .dms
+            .iter()
+            .find(|(other, _)| *other == id)
+            .and_then(|(_, nick)| nick.as_ref())
+        {
+            return (nick.as_str().to_owned(), false);
+        }
+        (shorten(&id.to_string(), 9), true)
+    }
+
+    fn call_event_id(event: &CallEvent) -> CallId {
+        match event {
+            CallEvent::CallOffered { call, .. }
+            | CallEvent::CallAccepted { call, .. }
+            | CallEvent::CallDeclined { call, .. }
+            | CallEvent::ParticipantJoined { call, .. }
+            | CallEvent::ParticipantLeft { call, .. }
+            | CallEvent::ScreenShareStarted { call, .. }
+            | CallEvent::ScreenShareStopped { call, .. }
+            | CallEvent::CallEnded { call, .. } => *call,
+        }
     }
 
     fn update(&mut self, message: Msg) -> Task<Msg> {
@@ -488,6 +598,115 @@ impl Mikall {
                 self.alarm = None;
                 Task::none()
             }
+            Msg::CallStart => {
+                let (Some(node), Some(target)) = (self.node(), self.active.clone()) else {
+                    return Task::none();
+                };
+                if self.call_in_progress() {
+                    return Task::none();
+                }
+                let me = self.me();
+                let peers: Vec<IdentityId> = match target {
+                    Target::Dm(id) => vec![id],
+                    Target::Channel(_) => self
+                        .members
+                        .iter()
+                        .map(|m| m.id)
+                        .filter(|id| Some(*id) != me)
+                        .collect(),
+                };
+                if peers.is_empty() {
+                    return Task::none();
+                }
+                Task::perform(
+                    async move { node.calls.start_call(peers).await },
+                    Msg::CallStarted,
+                )
+            }
+            Msg::CallStarted(id) => {
+                self.call = Some(CallUi { id, snapshot: None });
+                self.refresh_call(id)
+            }
+            Msg::CallAccept(id) => {
+                let Some(node) = self.node() else {
+                    return Task::none();
+                };
+                Task::perform(
+                    async move {
+                        node.calls
+                            .accept_incoming(id)
+                            .await
+                            .map_err(|e| e.to_string())
+                    },
+                    Msg::CallDone,
+                )
+            }
+            Msg::CallDecline(id) => {
+                let Some(node) = self.node() else {
+                    return Task::none();
+                };
+                Task::perform(
+                    async move {
+                        node.calls
+                            .decline_incoming(id)
+                            .await
+                            .map_err(|e| e.to_string())
+                    },
+                    Msg::CallDone,
+                )
+            }
+            Msg::CallHangUp(id) => {
+                let Some(node) = self.node() else {
+                    return Task::none();
+                };
+                Task::perform(
+                    async move { node.calls.hang_up_all(id).await.map_err(|e| e.to_string()) },
+                    Msg::CallDone,
+                )
+            }
+            // Success is silent: the call events land on the bus and the
+            // snapshot refresh moves the surface.
+            Msg::CallDone(Ok(())) => Task::none(),
+            Msg::CallDone(Err(error)) => {
+                self.alarm = Some(Alarm::Danger {
+                    title: "CALL",
+                    body: error,
+                });
+                Task::none()
+            }
+            Msg::CallSnapshot(Ok(snapshot)) => {
+                let me = self.me();
+                let Some(call) = &mut self.call else {
+                    return Task::none();
+                };
+                if call.id != snapshot.id {
+                    return Task::none();
+                }
+                // An offer that ended before it was ever rendered isn't
+                // worth interrupting for — skip to the next queued one.
+                let unseen_expired_offer = call.snapshot.is_none()
+                    && matches!(snapshot.phase, CallPhase::Ended { .. })
+                    && Some(snapshot.initiator) != me;
+                if unseen_expired_offer {
+                    self.call = None;
+                    return self.show_next_offer();
+                }
+                call.snapshot = Some(snapshot);
+                Task::none()
+            }
+            Msg::CallSnapshot(Err(_)) => {
+                // Unknown call: the service has nothing real to show.
+                self.call = None;
+                self.show_next_offer()
+            }
+            Msg::CallDismiss => {
+                self.call = None;
+                self.show_next_offer()
+            }
+            Msg::RingPulse => {
+                self.ring_glow = !self.ring_glow;
+                Task::none()
+            }
             Msg::Noop => Task::none(),
         }
     }
@@ -549,6 +768,7 @@ impl Mikall {
                 self.reload_active()
             }
             AppEvent::Domain(DomainEvent::Presence(_)) => self.load_presence(),
+            AppEvent::Domain(DomainEvent::Calls(event)) => self.handle_call_event(event),
             AppEvent::TransferSaved { path, .. } => {
                 self.alarm = Some(Alarm::Info {
                     body: format!("file saved to {path}"),
@@ -559,12 +779,46 @@ impl Mikall {
         }
     }
 
+    /// Call events never carry UI state — every one triggers a snapshot
+    /// refetch, so the surface always mirrors the aggregate.
+    fn handle_call_event(&mut self, event: CallEvent) -> Task<Msg> {
+        if let CallEvent::CallOffered { call, by, .. } = &event {
+            let incoming = Some(*by) != self.me();
+            if incoming && self.call.as_ref().map(|c| c.id) != Some(*call) {
+                if self.call_in_progress() {
+                    // Gentle interruption only: one call surface at a time.
+                    if !self.call_backlog.contains(call) {
+                        self.call_backlog.push(*call);
+                    }
+                    return Task::none();
+                }
+                self.call = Some(CallUi {
+                    id: *call,
+                    snapshot: None,
+                });
+                return self.refresh_call(*call);
+            }
+        }
+        let id = Self::call_event_id(&event);
+        if self.call.as_ref().map(|c| c.id) == Some(id) {
+            return self.refresh_call(id);
+        }
+        // A queued offer that died before being shown leaves the queue.
+        if matches!(
+            event,
+            CallEvent::CallDeclined { .. } | CallEvent::CallEnded { .. }
+        ) {
+            self.call_backlog.retain(|queued| *queued != id);
+        }
+        Task::none()
+    }
+
     fn subscription(&self) -> Subscription<Msg> {
         let Some(node) = &self.node else {
             return Subscription::none();
         };
         let bus = node.bus.clone();
-        Subscription::run_with_id(
+        let events = Subscription::run_with_id(
             "mikall-events",
             futures::stream::unfold(bus.subscribe(), |mut rx| async move {
                 loop {
@@ -575,7 +829,16 @@ impl Mikall {
                     }
                 }
             }),
-        )
+        );
+        if self.call_is_ringing() {
+            // The pulse only ticks while something actually rings.
+            Subscription::batch([
+                events,
+                iced::time::every(Duration::from_millis(700)).map(|_| Msg::RingPulse),
+            ])
+        } else {
+            events
+        }
     }
 
     fn view(&self) -> Element<'_, Msg> {
@@ -695,9 +958,254 @@ impl Mikall {
         if let Some(alarm) = &self.alarm {
             root = root.push(self.view_alarm(alarm));
         }
+        // The call surface docks below the alarm slot, above the panes:
+        // a gentle interruption, never a modal takeover. A future screen-
+        // share viewer pane can grow below this strip without touching
+        // the three-pane body.
+        if let Some(surface) = self.view_call() {
+            root = root.push(surface);
+        }
         let body = row![self.view_sidebar(), self.view_chat()]
             .push_maybe((self.show_roster && self.active.is_some()).then(|| self.view_roster()));
         root.push(body.height(Fill)).into()
+    }
+
+    fn view_call(&self) -> Option<Element<'_, Msg>> {
+        let call = self.call.as_ref()?;
+        let snapshot = call.snapshot.as_ref()?;
+        let id = call.id;
+        let outgoing = Some(snapshot.initiator) == self.me();
+        Some(match &snapshot.phase {
+            CallPhase::Ringing { offered_to } if outgoing => {
+                self.view_call_ringing_out(id, offered_to)
+            }
+            CallPhase::Ringing { .. } => self.view_call_offer(id, snapshot.initiator),
+            CallPhase::Connecting => self.view_call_connecting(id),
+            CallPhase::Active => self.view_call_active(id, snapshot),
+            CallPhase::Ended { reason } => Self::view_call_ended(*reason),
+        })
+    }
+
+    /// Outgoing ring: callee label + "ringing…" + cancel.
+    fn view_call_ringing_out(&self, id: CallId, offered_to: &[IdentityId]) -> Element<'_, Msg> {
+        let callees = offered_to
+            .iter()
+            .map(|peer| self.peer_label(*peer).0)
+            .collect::<Vec<_>>()
+            .join(", ");
+        container(
+            row![
+                text("RINGING").size(11).font(MONO_BOLD).color(theme::TEAL),
+                text(format!("calling {callees} — ringing…"))
+                    .size(13)
+                    .width(Fill),
+                button(text("cancel").size(12).font(MONO))
+                    .style(theme::danger_outline)
+                    .padding([4, 14])
+                    .on_press(Msg::CallHangUp(id)),
+            ]
+            .spacing(12)
+            .align_y(iced::Center),
+        )
+        .style(theme::call_ringing(self.ring_glow))
+        .padding([8, 14])
+        .width(Fill)
+        .into()
+    }
+
+    /// Incoming offer: caller label + accept / decline.
+    fn view_call_offer(&self, id: CallId, caller: IdentityId) -> Element<'_, Msg> {
+        let (label, mono) = self.peer_label(caller);
+        let caller_text = if mono {
+            text(label).size(13).font(MONO)
+        } else {
+            text(label).size(13).font(SEMIBOLD)
+        };
+        container(
+            row![
+                text("INCOMING CALL")
+                    .size(11)
+                    .font(MONO_BOLD)
+                    .color(theme::TEAL),
+                caller_text,
+                text("is calling — voice")
+                    .size(13)
+                    .color(theme::MUTED)
+                    .width(Fill),
+                button(text("accept").size(12).font(SEMIBOLD))
+                    .style(theme::primary)
+                    .padding([4, 14])
+                    .on_press(Msg::CallAccept(id)),
+                button(text("decline").size(12).font(MONO))
+                    .style(theme::danger_outline)
+                    .padding([4, 14])
+                    .on_press(Msg::CallDecline(id)),
+            ]
+            .spacing(12)
+            .align_y(iced::Center),
+        )
+        .style(theme::call_ringing(self.ring_glow))
+        .padding([8, 14])
+        .width(Fill)
+        .into()
+    }
+
+    /// Brief transitional state while media transports come up.
+    fn view_call_connecting(&self, id: CallId) -> Element<'_, Msg> {
+        container(
+            row![
+                text("CONNECTING")
+                    .size(11)
+                    .font(MONO_BOLD)
+                    .color(theme::TEAL),
+                text("setting up media…")
+                    .size(13)
+                    .color(theme::MUTED)
+                    .width(Fill),
+                Self::honesty_label(),
+                button(text("hang up").size(12).font(MONO))
+                    .style(theme::danger_outline)
+                    .padding([4, 14])
+                    .on_press(Msg::CallHangUp(id)),
+            ]
+            .spacing(12)
+            .align_y(iced::Center),
+        )
+        .style(theme::call_panel)
+        .padding([8, 14])
+        .width(Fill)
+        .into()
+    }
+
+    /// Active call: participant tiles (max 8, rows of 4) + controls.
+    /// Mute/deafen toggles are absent on purpose: no use-case service
+    /// exposes them yet, and a control that does nothing would lie.
+    fn view_call_active(&self, id: CallId, snapshot: &CallSnapshot) -> Element<'_, Msg> {
+        let header = row![
+            text("VOICE CALL")
+                .size(11)
+                .font(MONO_BOLD)
+                .color(theme::TEAL),
+            text(format!(
+                "mesh {}/{}",
+                snapshot.participants.len(),
+                CallRoster::MAX_PARTICIPANTS
+            ))
+            .size(10)
+            .font(MONO)
+            .color(theme::MUTED)
+            .width(Fill),
+            Self::honesty_label(),
+        ]
+        .spacing(12)
+        .align_y(iced::Center);
+
+        let mut grid = Column::new().spacing(8).align_x(iced::Center);
+        for tiles in snapshot.participants.chunks(4) {
+            let mut line = Row::new().spacing(8);
+            for (who, media) in tiles {
+                line = line.push(self.view_call_tile(*who, *media));
+            }
+            grid = grid.push(line);
+        }
+
+        let controls = row![button(text("hang up").size(12).font(SEMIBOLD))
+            .style(theme::danger)
+            .padding([6, 20])
+            .on_press(Msg::CallHangUp(id))]
+        .spacing(10);
+
+        container(
+            column![
+                header,
+                container(grid).center_x(Fill),
+                container(controls).center_x(Fill),
+            ]
+            .spacing(10),
+        )
+        .style(theme::call_panel)
+        .padding([12, 18])
+        .width(Fill)
+        .into()
+    }
+
+    fn view_call_tile(&self, who: IdentityId, media: MediaState) -> Element<'_, Msg> {
+        let is_me = self.me() == Some(who);
+        let (label, mono) = self.peer_label(who);
+        let name = if mono {
+            text(label).size(13).font(MONO)
+        } else {
+            text(label).size(13).font(SEMIBOLD)
+        };
+        let mut head = Row::new().spacing(6).align_y(iced::Center).push(name);
+        if is_me {
+            head = head.push(text("you").size(9).font(MONO).color(theme::MUTED));
+        }
+        let mut tile = Column::new().spacing(5).align_x(iced::Center).push(head);
+        // Real per-participant media state from the aggregate. The
+        // sharing_screen flag is deliberately unrendered here — the
+        // screen-share viewer is the next milestone.
+        let mut chips = Row::new().spacing(4);
+        let flagged = media.mic_muted || media.deafened;
+        if media.mic_muted {
+            chips = chips.push(Self::media_chip("mic off"));
+        }
+        if media.deafened {
+            chips = chips.push(Self::media_chip("deafened"));
+        }
+        if flagged {
+            tile = tile.push(chips);
+        }
+        container(tile)
+            .style(theme::call_tile)
+            .padding([10, 14])
+            .width(150)
+            .align_x(iced::Center)
+            .into()
+    }
+
+    fn media_chip(label: &str) -> Element<'_, Msg> {
+        container(text(label).size(9).font(MONO))
+            .style(theme::chip_danger)
+            .padding([2, 6])
+            .into()
+    }
+
+    /// Brief §3.3: the persistent honesty label of every connected state.
+    fn honesty_label() -> Element<'static, Msg> {
+        text("direct connection — participants can see your IP")
+            .size(10)
+            .font(MONO)
+            .color(theme::MUTED)
+            .into()
+    }
+
+    fn view_call_ended(reason: EndReason) -> Element<'static, Msg> {
+        let reason = match reason {
+            EndReason::HungUp => "hung up",
+            EndReason::Declined => "declined",
+            EndReason::Failed => "failed",
+            EndReason::LastParticipantLeft => "last participant left",
+        };
+        container(
+            row![
+                text("CALL ENDED")
+                    .size(11)
+                    .font(MONO_BOLD)
+                    .color(theme::MUTED),
+                text(reason).size(13).width(Fill),
+                button(text("dismiss").size(11).font(MONO))
+                    .style(theme::ghost)
+                    .padding([3, 10])
+                    .on_press(Msg::CallDismiss),
+            ]
+            .spacing(12)
+            .align_y(iced::Center),
+        )
+        .style(theme::call_panel)
+        .padding([8, 14])
+        .width(Fill)
+        .into()
     }
 
     fn view_alarm<'a>(&'a self, alarm: &'a Alarm) -> Element<'a, Msg> {
@@ -922,10 +1430,23 @@ impl Mikall {
             }
         };
 
+        // Ring the DM partner, or every member of the channel (the mesh
+        // itself is capped at 8 by the domain as people actually join).
+        let me = self.me();
+        let can_call = !self.call_in_progress()
+            && match active {
+                Target::Dm(_) => true,
+                Target::Channel(_) => self.members.iter().any(|m| Some(m.id) != me),
+            };
+
         let topic_bar = container(
             row![
                 text(title).size(15).font(MONO_BOLD).color(theme::TEAL),
                 text(&self.topic).size(13).color(theme::MUTED).width(Fill),
+                button(text("call").size(11).font(MONO))
+                    .style(theme::ghost)
+                    .padding([3, 10])
+                    .on_press_maybe(can_call.then_some(Msg::CallStart)),
                 button(
                     text(if self.show_roster {
                         "roster »"
