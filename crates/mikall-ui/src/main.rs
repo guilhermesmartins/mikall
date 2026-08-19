@@ -236,6 +236,8 @@ enum Msg {
     CallAccept(CallId),
     CallDecline(CallId),
     CallHangUp(CallId),
+    /// Ring one more peer into the ongoing call (mid-call invite).
+    CallInvite(CallId, IdentityId),
     /// Toggle our own screen share (true = start, false = stop).
     ShareScreen(CallId, bool),
     /// Expand the viewer pane for a remote sharer (local view only).
@@ -582,6 +584,8 @@ impl Mikall {
     fn call_event_id(event: &CallEvent) -> CallId {
         match event {
             CallEvent::CallOffered { call, .. }
+            | CallEvent::CallOpened { call, .. }
+            | CallEvent::CallInvited { call, .. }
             | CallEvent::CallAccepted { call, .. }
             | CallEvent::CallDeclined { call, .. }
             | CallEvent::ParticipantJoined { call, .. }
@@ -1007,6 +1011,8 @@ impl Mikall {
                     return Task::none();
                 }
                 let me = self.me();
+                // Nobody else around? An empty offer list opens a solo
+                // stage — active with just us, ready to ring people in.
                 let peers: Vec<IdentityId> = match target {
                     Target::Dm(id) => vec![id],
                     Target::Channel(_) => self
@@ -1016,9 +1022,6 @@ impl Mikall {
                         .filter(|id| Some(*id) != me)
                         .collect(),
                 };
-                if peers.is_empty() {
-                    return Task::none();
-                }
                 Task::perform(
                     async move { node.calls.start_call(peers).await },
                     Msg::CallStarted,
@@ -1054,6 +1057,20 @@ impl Mikall {
                     async move {
                         node.calls
                             .decline_incoming(id)
+                            .await
+                            .map_err(|e| e.to_string())
+                    },
+                    Msg::CallDone,
+                )
+            }
+            Msg::CallInvite(id, who) => {
+                let Some(node) = self.node() else {
+                    return Task::none();
+                };
+                Task::perform(
+                    async move {
+                        node.calls
+                            .invite(id, vec![who])
                             .await
                             .map_err(|e| e.to_string())
                     },
@@ -1645,6 +1662,22 @@ impl Mikall {
             Some(peer) => body = body.push(self.view_share_viewer(peer)),
             None => body = body.push(container(grid).center_x(Fill)),
         }
+        // The stage is a room: whoever is here (channel members, or the DM
+        // partner) but not in the call can be rung in from below. Alone on
+        // an open stage is a legal, honest state — say so plainly.
+        let candidates = self.invite_candidates(snapshot);
+        if snapshot.participants.len() == 1 {
+            let line = if candidates.is_empty() && snapshot.invited.is_empty() {
+                "you're on stage alone — no one else is here to ring yet"
+            } else {
+                "you're on stage alone — ring someone below, or wait"
+            };
+            body = body
+                .push(container(text(line).size(11).font(MONO).color(theme::MUTED)).center_x(Fill));
+        }
+        if !candidates.is_empty() || !snapshot.invited.is_empty() {
+            body = body.push(self.view_ring_list(id, snapshot, &candidates));
+        }
         if i_am_sharing {
             // Our own share never gets a self-viewer — just the plain
             // state, said honestly (§5): the share is real signaling, but
@@ -1709,6 +1742,87 @@ impl Mikall {
             .spacing(8)
             .width(Fill)
             .into()
+    }
+
+    /// Channel members (or the DM partner) who are neither in the call nor
+    /// already rung — the ring buttons of the active-call view.
+    fn invite_candidates(&self, snapshot: &CallSnapshot) -> Vec<IdentityId> {
+        let me = self.me();
+        let absent = |id: &IdentityId| {
+            Some(*id) != me
+                && !snapshot.participants.iter().any(|(who, _)| who == id)
+                && !snapshot.invited.contains(id)
+        };
+        match &self.active {
+            Some(Target::Channel(_)) => self.members.iter().map(|m| m.id).filter(absent).collect(),
+            Some(Target::Dm(peer)) => [*peer].into_iter().filter(absent).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// The ring/invite strip of an active call: absent peers each get a
+    /// "ring" button; peers already rung show as ringing until they answer
+    /// or decline — never a second ring button.
+    fn view_ring_list(
+        &self,
+        id: CallId,
+        snapshot: &CallSnapshot,
+        candidates: &[IdentityId],
+    ) -> Element<'_, Msg> {
+        let entries: Vec<(IdentityId, bool)> = snapshot
+            .invited
+            .iter()
+            .map(|peer| (*peer, true))
+            .chain(candidates.iter().map(|peer| (*peer, false)))
+            .collect();
+        let mut list = Column::new().spacing(6).align_x(iced::Center);
+        for chunk in entries.chunks(4) {
+            let mut line = Row::new().spacing(8).align_y(iced::Center);
+            for (peer, pending) in chunk {
+                let (label, mono) = self.peer_label(*peer);
+                let name = if mono {
+                    text(label).size(12).font(MONO)
+                } else {
+                    text(label).size(12).font(SEMIBOLD)
+                };
+                let entry: Element<'_, Msg> = if *pending {
+                    row![
+                        name,
+                        text("ringing…").size(10).font(MONO).color(theme::TEAL),
+                    ]
+                    .spacing(8)
+                    .align_y(iced::Center)
+                    .into()
+                } else {
+                    row![
+                        name,
+                        button(text("ring").size(10).font(MONO))
+                            .style(theme::ghost)
+                            .padding([2, 10])
+                            .on_press(Msg::CallInvite(id, *peer)),
+                    ]
+                    .spacing(8)
+                    .align_y(iced::Center)
+                    .into()
+                };
+                line = line.push(container(entry).style(theme::call_tile).padding([6, 12]));
+            }
+            list = list.push(line);
+        }
+        column![
+            container(
+                text("not in the call")
+                    .size(10)
+                    .font(MONO)
+                    .color(theme::MUTED)
+            )
+            .center_x(Fill),
+            list,
+        ]
+        .spacing(6)
+        .align_x(iced::Center)
+        .width(Fill)
+        .into()
     }
 
     fn view_call_tile(&self, who: IdentityId, media: MediaState) -> Element<'_, Msg> {
@@ -2035,12 +2149,9 @@ impl Mikall {
 
         // Ring the DM partner, or every member of the channel (the mesh
         // itself is capped at 8 by the domain as people actually join).
-        let me = self.me();
-        let can_call = !self.call_in_progress()
-            && match active {
-                Target::Dm(_) => true,
-                Target::Channel(_) => self.members.iter().any(|m| Some(m.id) != me),
-            };
+        // Alone is fine too: calling with nobody else here opens a solo
+        // stage to ring people into as they arrive.
+        let can_call = !self.call_in_progress();
 
         let call_button = button(text("call").size(11).font(MONO))
             .style(theme::ghost)
@@ -2051,14 +2162,9 @@ impl Mikall {
         let call_button: Element<'_, Msg> = if can_call {
             call_button.into()
         } else {
-            let reason = if self.call_in_progress() {
-                "a call is already up — hang up first"
-            } else {
-                "no one else is here to call — connect a peer in settings → network"
-            };
             tooltip(
                 call_button,
-                container(text(reason).size(11))
+                container(text("a call is already up — hang up first").size(11))
                     .style(theme::card)
                     .padding([4, 8]),
                 tooltip::Position::Bottom,

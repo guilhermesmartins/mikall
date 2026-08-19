@@ -314,17 +314,38 @@ async fn clears_away(world: &mut MikallWorld, who: String) {
 async fn call_with_joiners(world: &mut MikallWorld, who: String, joiners: u8) {
     world.ensure_node(&who).await;
     let calls = Arc::clone(&world.node(&who).calls);
+    // Zero offers opens a solo stage: active immediately, peers join it.
     let call = calls.start_call(vec![]).await;
     world.call_peers = (0..joiners)
         .map(|n| MikallWorld::synthetic_id("callpeer", n + 100))
         .collect();
-    calls.accept(call, world.call_peers[0]).await.unwrap();
-    calls.mark_connected(call).await.unwrap();
-    for peer in &world.call_peers[1..joiners as usize] {
+    for peer in &world.call_peers {
         calls.join(call, *peer).await.unwrap();
     }
     world.call = Some(call);
     world.call_node = Some(who);
+}
+
+#[when(expr = "{string} opens a solo call")]
+async fn opens_solo_call(world: &mut MikallWorld, who: String) {
+    world.ensure_node(&who).await;
+    let call = world.node(&who).calls.start_call(vec![]).await;
+    world.call = Some(call);
+    world.call_node = Some(who);
+    world.call_peers = Vec::new();
+}
+
+#[when(expr = "{string} invites {string} to the call")]
+async fn invites_to_call(world: &mut MikallWorld, who: String, callee: String) {
+    let call = world.call.unwrap();
+    let callee_id = MikallWorld::synthetic_id(&callee, 0x33);
+    world
+        .node(&who)
+        .calls
+        .invite(call, vec![callee_id])
+        .await
+        .unwrap();
+    world.call_peers = vec![callee_id];
 }
 
 #[when(expr = "{string} starts a call to {string}")]
@@ -591,12 +612,39 @@ async fn sees_online(world: &mut MikallWorld, who: String, target: String) {
     assert_eq!(state, PresenceState::Online);
 }
 
-#[then(expr = "the call has {int} participants")]
+#[then(expr = "the call has {int} participant(s)")]
 async fn call_participants(world: &mut MikallWorld, count: usize) {
     let call = world.call.unwrap();
     let node = world.call_node.clone().unwrap();
     let snapshot = world.node(&node).calls.snapshot(call).await.unwrap();
     assert_eq!(snapshot.participants.len(), count);
+}
+
+#[then(expr = "the call is still active")]
+async fn call_still_active(world: &mut MikallWorld) {
+    let call = world.call.unwrap();
+    let node = world.call_node.clone().unwrap();
+    let snapshot = world.node(&node).calls.snapshot(call).await.unwrap();
+    assert!(
+        matches!(snapshot.phase, CallPhase::Active),
+        "expected active, got {:?}",
+        snapshot.phase
+    );
+}
+
+#[then(expr = "inviting another peer is refused because the mesh is full")]
+async fn invite_refused_full(world: &mut MikallWorld) {
+    let call = world.call.unwrap();
+    let node = world.call_node.clone().unwrap();
+    let extra = MikallWorld::synthetic_id("callpeer", 252);
+    let result = world.node(&node).calls.invite(call, vec![extra]).await;
+    assert!(
+        matches!(
+            result,
+            Err(CallServiceError::Call(CallError::NoFreeSeat { .. }))
+        ),
+        "expected NoFreeSeat, got {result:?}"
+    );
 }
 
 #[then(expr = "a 9th participant is rejected with the mesh-limit error")]

@@ -444,9 +444,8 @@ mod tests {
 
         // Read-modify-write keeps the nickname while remembering peers.
         let mut record = store.load().await.unwrap();
-        record.remember_peer(
-            PeerAddr::parse("/ip4/192.168.1.7/tcp/4001/p2p/12D3KooWQvcGm").unwrap(),
-        );
+        record
+            .remember_peer(PeerAddr::parse("/ip4/192.168.1.7/tcp/4001/p2p/12D3KooWQvcGm").unwrap());
         record.remember_peer(PeerAddr::parse("/ip4/10.0.0.9/udp/4001/quic-v1").unwrap());
         store.save(&record).await.unwrap();
 
@@ -456,10 +455,7 @@ mod tests {
         assert_eq!(loaded.nickname, Some(Nickname::parse("miku").unwrap()));
         // Most-recent-first order survives the round trip.
         assert_eq!(loaded.peers, record.peers);
-        assert_eq!(
-            loaded.peers[0].as_str(),
-            "/ip4/10.0.0.9/udp/4001/quic-v1"
-        );
+        assert_eq!(loaded.peers[0].as_str(), "/ip4/10.0.0.9/udp/4001/quic-v1");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

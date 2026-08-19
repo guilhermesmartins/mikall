@@ -33,6 +33,9 @@ pub struct CallSnapshot {
     pub initiator: IdentityId,
     pub phase: CallPhase,
     pub participants: Vec<(IdentityId, MediaState)>,
+    /// Offered-but-not-joined: rung (initially or mid-call) and yet to
+    /// answer. Frontends render these as "ringing" and must not re-ring.
+    pub invited: Vec<IdentityId>,
 }
 
 type MediaTap = mpsc::Sender<(IdentityId, Vec<u8>)>;
@@ -72,7 +75,9 @@ impl CallService {
         }
     }
 
-    /// Ring one or more peers. The mesh cap (8) is enforced by the roster
+    /// Ring one or more peers — or nobody: an empty list opens a solo
+    /// stage, active immediately with only us, peers rung later via
+    /// [`CallService::invite`]. The mesh cap (8) is enforced by the roster
     /// as participants actually join.
     pub async fn start_call(&self, offered_to: Vec<IdentityId>) -> CallId {
         let id = self.idgen.call_id();
@@ -101,6 +106,48 @@ impl CallService {
     /// The AEAD key protecting this call's media frames.
     pub async fn media_key(&self, id: CallId) -> Option<[u8; 32]> {
         self.call_keys.read().await.get(&id).copied()
+    }
+
+    /// Ring more peers into an ongoing call. Each fresh invitee gets the
+    /// same `CallAction::Offer` envelope as an initial ring — carrying the
+    /// call's existing media key — so their incoming-offer flow (and their
+    /// ability to seal/unseal frames on accept) is unchanged.
+    pub async fn invite(&self, id: CallId, peers: Vec<IdentityId>) -> Result<(), CallServiceError> {
+        let me = self.identity.local_id();
+        let media_key = self
+            .media_key(id)
+            .await
+            .ok_or(CallServiceError::UnknownCall)?;
+        let (event, participants) = {
+            let mut calls = self.calls.write().await;
+            let call = calls.get_mut(&id).ok_or(CallServiceError::UnknownCall)?;
+            let event = call.invite(me, &peers)?;
+            let participants: Vec<IdentityId> =
+                call.roster().members().map(|(who, _)| who).collect();
+            (event, participants)
+        };
+        // `Call::invite` always yields `CallInvited` with the deduplicated
+        // fresh invitees — exactly who needs an offer envelope.
+        let fresh = if let CallEvent::CallInvited { to, .. } = &event {
+            to.clone()
+        } else {
+            Vec::new()
+        };
+        self.bus.publish_domain(event);
+        for peer in fresh {
+            let _ = self
+                .signaling
+                .send(
+                    peer,
+                    id,
+                    CallAction::Offer {
+                        participants: participants.clone(),
+                        media_key,
+                    },
+                )
+                .await;
+        }
+        Ok(())
     }
 
     /// Accept a call that was offered to us.
@@ -193,10 +240,16 @@ impl CallService {
             let mut calls = self.calls.write().await;
             match action {
                 CallAction::Offer { media_key, .. } => {
-                    if let std::collections::btree_map::Entry::Vacant(entry) = calls.entry(id) {
+                    // Fresh offer, or a re-ring of a call we declined or
+                    // left earlier (its ended aggregate is superseded).
+                    let fresh = match calls.get(&id) {
+                        None => true,
+                        Some(call) => matches!(call.phase(), CallPhase::Ended { .. }),
+                    };
+                    if fresh {
                         let me = self.identity.local_id();
                         let (call, event) = Call::offer(id, from, vec![me]);
-                        entry.insert(call);
+                        calls.insert(id, call);
                         self.call_keys.write().await.insert(id, media_key);
                         events.push(event);
                     }
@@ -220,14 +273,27 @@ impl CallService {
                     if let Some(call) = calls.get_mut(&id) {
                         match call.leave(from) {
                             Ok(mut left) => events.append(&mut left),
-                            Err(_) => {
-                                if let Ok(event) = call.hang_up() {
-                                    events.push(event);
+                            // Never seated: an invited peer ringing off is a
+                            // decline, and must not tear down a call others
+                            // are still in. Only a peer neither seated nor
+                            // invited hanging up ends our copy outright.
+                            Err(_) => match call.decline(from) {
+                                Ok(mut declined) => events.append(&mut declined),
+                                Err(_) => {
+                                    if let Ok(event) = call.hang_up() {
+                                        events.push(event);
+                                    }
                                 }
-                            }
+                            },
                         }
+                        // The media tap lives as long as the call does — a
+                        // single participant leaving must not silence it.
+                        if matches!(call.phase(), CallPhase::Ended { .. }) {
+                            self.media_taps.write().await.remove(&id);
+                        }
+                    } else {
+                        self.media_taps.write().await.remove(&id);
                     }
-                    self.media_taps.write().await.remove(&id);
                 }
                 CallAction::ScreenShare { active } => {
                     if let Some(call) = calls.get_mut(&id) {
@@ -360,6 +426,7 @@ impl CallService {
             initiator: call.initiator(),
             phase: call.phase().clone(),
             participants: call.roster().members().collect(),
+            invited: call.invited().collect(),
         })
     }
 }

@@ -4,9 +4,14 @@
 //! participant sends media to every other. The mesh limit (8) is therefore a
 //! *domain invariant* enforced by [`CallRoster`]'s construction, not a UI
 //! suggestion — a 9th participant is unrepresentable.
+//!
+//! A call opened with nobody to ring is a *solo stage*: legal, immediately
+//! [`CallPhase::Active`] with only its opener, who rings people later via
+//! [`Call::invite`]. Staying alone is a choice — a solo stage never ends by
+//! "last participant left" while the opener holds it; only hanging up does.
 
 use core::fmt;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::shared::IdentityId;
 
@@ -220,6 +225,17 @@ pub enum CallEvent {
         by: IdentityId,
         to: Vec<IdentityId>,
     },
+    /// A solo stage opened: active immediately with only its opener.
+    CallOpened {
+        call: CallId,
+        by: IdentityId,
+    },
+    /// Peers rung into an ongoing call (mid-call invite).
+    CallInvited {
+        call: CallId,
+        by: IdentityId,
+        to: Vec<IdentityId>,
+    },
     CallAccepted {
         call: CallId,
         by: IdentityId,
@@ -258,6 +274,15 @@ pub enum CallError {
     Transition(#[from] InvalidTransition),
     #[error("call has ended")]
     Ended,
+    #[error("peer was not offered this call")]
+    NotInvited,
+    #[error("everyone named is already in the call or already invited")]
+    AlreadyInvited,
+    #[error(
+        "no free seat: {seated} in the call and {pending} already invited of {max}",
+        max = CallRoster::MAX_PARTICIPANTS
+    )]
+    NoFreeSeat { seated: usize, pending: usize },
 }
 
 /// The `Call` aggregate.
@@ -266,19 +291,33 @@ pub struct Call {
     id: CallId,
     initiator: IdentityId,
     roster: CallRoster,
+    /// Offered-but-not-joined: everyone rung (at offer time or mid-call)
+    /// who has neither accepted into the roster nor declined. Accepting
+    /// requires membership here — an uninvited accept is unrepresentable.
+    invited: BTreeSet<IdentityId>,
+    /// Opened with nobody to ring: the opener holds the stage alone by
+    /// choice, so "last participant left" never fires while they stay.
+    solo_stage: bool,
     phase: CallPhase,
 }
 
 impl Call {
+    /// Ring `offered_to`. An empty list is a [`Call::open_solo`] — a
+    /// ringing call with nobody to answer it is unrepresentable.
     pub fn offer(
         id: CallId,
         initiator: IdentityId,
         offered_to: Vec<IdentityId>,
     ) -> (Self, CallEvent) {
+        if offered_to.is_empty() {
+            return Self::open_solo(id, initiator);
+        }
         let call = Call {
             id,
             initiator,
             roster: CallRoster::solo(initiator),
+            invited: offered_to.iter().copied().collect(),
+            solo_stage: false,
             phase: CallPhase::Ringing {
                 offered_to: offered_to.clone(),
             },
@@ -287,6 +326,24 @@ impl Call {
             call: id,
             by: initiator,
             to: offered_to,
+        };
+        (call, event)
+    }
+
+    /// Open a solo stage: active immediately with only the opener, who
+    /// rings people later via [`Call::invite`].
+    pub fn open_solo(id: CallId, initiator: IdentityId) -> (Self, CallEvent) {
+        let call = Call {
+            id,
+            initiator,
+            roster: CallRoster::solo(initiator),
+            invited: BTreeSet::new(),
+            solo_stage: true,
+            phase: CallPhase::Active,
+        };
+        let event = CallEvent::CallOpened {
+            call: id,
+            by: initiator,
         };
         (call, event)
     }
@@ -305,6 +362,15 @@ impl Call {
 
     pub fn roster(&self) -> &CallRoster {
         &self.roster
+    }
+
+    /// Offered-but-not-joined peers (initial ring plus mid-call invites).
+    pub fn invited(&self) -> impl Iterator<Item = IdentityId> + '_ {
+        self.invited.iter().copied()
+    }
+
+    pub fn is_solo_stage(&self) -> bool {
+        self.solo_stage
     }
 
     fn take_phase(&mut self) -> CallPhase {
@@ -333,9 +399,21 @@ impl Call {
         }
     }
 
+    /// An invited peer picks up. The first pickup moves a ring to
+    /// [`CallPhase::Connecting`]; later pickups (a second callee, a
+    /// mid-call invitee) land in the already connecting/active call.
     pub fn accept(&mut self, by: IdentityId) -> Result<Vec<CallEvent>, CallError> {
-        self.transition(CallPhase::accept)?;
+        if matches!(self.phase, CallPhase::Ended { .. }) {
+            return Err(CallError::Ended);
+        }
+        if !self.invited.contains(&by) {
+            return Err(CallError::NotInvited);
+        }
         self.roster.add(by)?;
+        self.invited.remove(&by);
+        if matches!(self.phase, CallPhase::Ringing { .. }) {
+            self.transition(CallPhase::accept)?;
+        }
         Ok(vec![
             CallEvent::CallAccepted { call: self.id, by },
             CallEvent::ParticipantJoined {
@@ -345,15 +423,69 @@ impl Call {
         ])
     }
 
+    /// An invited peer turns the call down. The call itself dies only when
+    /// the decline leaves nobody to wait for: still ringing with no other
+    /// callee pending. An invitee declining an ongoing call (or one of
+    /// several ringing callees) never tears it down for those in it.
     pub fn decline(&mut self, by: IdentityId) -> Result<Vec<CallEvent>, CallError> {
-        self.transition(CallPhase::decline)?;
-        Ok(vec![
-            CallEvent::CallDeclined { call: self.id, by },
-            CallEvent::CallEnded {
+        if matches!(self.phase, CallPhase::Ended { .. }) {
+            return Err(CallError::Ended);
+        }
+        if !self.invited.remove(&by) {
+            return Err(CallError::NotInvited);
+        }
+        let mut events = vec![CallEvent::CallDeclined { call: self.id, by }];
+        if let CallPhase::Ringing { offered_to } = &mut self.phase {
+            offered_to.retain(|peer| *peer != by);
+        }
+        if matches!(self.phase, CallPhase::Ringing { .. }) && self.invited.is_empty() {
+            self.transition(CallPhase::decline)?;
+            events.push(CallEvent::CallEnded {
                 call: self.id,
                 reason: EndReason::Declined,
-            },
-        ])
+            });
+        }
+        Ok(events)
+    }
+
+    /// Ring more peers into an ongoing call. Peers already in the roster
+    /// or already invited are not re-rung; the mesh cap is respected at
+    /// invite time counting both seats taken and invites outstanding.
+    pub fn invite(&mut self, by: IdentityId, to: &[IdentityId]) -> Result<CallEvent, CallError> {
+        match self.phase {
+            CallPhase::Connecting | CallPhase::Active => {}
+            CallPhase::Ringing { .. } => {
+                return Err(CallError::Transition(InvalidTransition {
+                    action: "invite",
+                    state: self.phase.name(),
+                }));
+            }
+            CallPhase::Ended { .. } => return Err(CallError::Ended),
+        }
+        let mut fresh: Vec<IdentityId> = Vec::new();
+        for peer in to.iter().copied() {
+            if !self.roster.contains(&peer)
+                && !self.invited.contains(&peer)
+                && !fresh.contains(&peer)
+            {
+                fresh.push(peer);
+            }
+        }
+        if fresh.is_empty() {
+            return Err(CallError::AlreadyInvited);
+        }
+        if self.roster.len() + self.invited.len() + fresh.len() > CallRoster::MAX_PARTICIPANTS {
+            return Err(CallError::NoFreeSeat {
+                seated: self.roster.len(),
+                pending: self.invited.len(),
+            });
+        }
+        self.invited.extend(fresh.iter().copied());
+        Ok(CallEvent::CallInvited {
+            call: self.id,
+            by,
+            to: fresh,
+        })
     }
 
     pub fn connected(&mut self) -> Result<(), CallError> {
@@ -375,7 +507,11 @@ impl Call {
     pub fn leave(&mut self, who: IdentityId) -> Result<Vec<CallEvent>, CallError> {
         self.roster.remove(&who)?;
         let mut events = vec![CallEvent::ParticipantLeft { call: self.id, who }];
-        if self.roster.len() <= 1 {
+        // On a solo stage the opener alone is not "last participant left":
+        // staying is their choice, hanging up is how they end it.
+        let opener_holds_the_stage =
+            self.solo_stage && self.roster.len() == 1 && self.roster.contains(&self.initiator);
+        if self.roster.len() <= 1 && !opener_holds_the_stage {
             let current = self.take_phase();
             self.phase = match current {
                 CallPhase::Ended { reason } => CallPhase::Ended { reason },
@@ -454,7 +590,129 @@ mod tests {
     fn cannot_accept_twice() {
         let (mut call, _) = Call::offer(CallId::from_bytes([1; 16]), id(1), vec![id(2)]);
         call.accept(id(2)).unwrap();
-        assert!(matches!(call.accept(id(3)), Err(CallError::Transition(_))));
+        // Neither an uninvited peer nor the already-seated callee can accept.
+        assert_eq!(call.accept(id(3)), Err(CallError::NotInvited));
+        assert_eq!(call.accept(id(2)), Err(CallError::NotInvited));
+    }
+
+    #[test]
+    fn solo_start_is_active_with_only_the_opener() {
+        let (call, event) = Call::offer(CallId::from_bytes([2; 16]), id(1), vec![]);
+        assert!(matches!(call.phase(), CallPhase::Active));
+        assert_eq!(call.roster().len(), 1);
+        assert!(call.roster().contains(&id(1)));
+        assert!(call.is_solo_stage());
+        assert!(matches!(event, CallEvent::CallOpened { by, .. } if by == id(1)));
+    }
+
+    #[test]
+    fn solo_stage_survives_its_guest_leaving() {
+        let (mut call, _) = Call::open_solo(CallId::from_bytes([2; 16]), id(1));
+        call.invite(id(1), &[id(2)]).unwrap();
+        call.accept(id(2)).unwrap();
+        assert_eq!(call.roster().len(), 2);
+        let events = call.leave(id(2)).unwrap();
+        assert_eq!(
+            events,
+            vec![CallEvent::ParticipantLeft {
+                call: call.id(),
+                who: id(2),
+            }]
+        );
+        assert!(matches!(call.phase(), CallPhase::Active));
+        assert_eq!(call.roster().len(), 1);
+    }
+
+    #[test]
+    fn invitee_decline_leaves_the_call_alive() {
+        let (mut call, _) = Call::open_solo(CallId::from_bytes([2; 16]), id(1));
+        call.invite(id(1), &[id(2)]).unwrap();
+        let events = call.decline(id(2)).unwrap();
+        assert_eq!(
+            events,
+            vec![CallEvent::CallDeclined {
+                call: call.id(),
+                by: id(2),
+            }]
+        );
+        assert!(matches!(call.phase(), CallPhase::Active));
+        assert_eq!(call.invited().count(), 0);
+    }
+
+    #[test]
+    fn invite_respects_the_mesh_cap() {
+        let mut call = active_call();
+        for n in 3..=8 {
+            call.join(id(n)).unwrap();
+        }
+        assert_eq!(
+            call.invite(id(1), &[id(9)]),
+            Err(CallError::NoFreeSeat {
+                seated: 8,
+                pending: 0,
+            })
+        );
+        // Outstanding invites claim seats too: 1 seated + 7 invited is full.
+        let (mut solo, _) = Call::open_solo(CallId::from_bytes([3; 16]), id(1));
+        let invitees: Vec<IdentityId> = (2..=8).map(id).collect();
+        solo.invite(id(1), &invitees).unwrap();
+        assert_eq!(
+            solo.invite(id(1), &[id(9)]),
+            Err(CallError::NoFreeSeat {
+                seated: 1,
+                pending: 7,
+            })
+        );
+    }
+
+    #[test]
+    fn invite_skips_the_seated_and_already_invited() {
+        let mut call = active_call();
+        let event = call.invite(id(1), &[id(1), id(2), id(3), id(3)]).unwrap();
+        assert!(matches!(
+            &event,
+            CallEvent::CallInvited { to, .. } if *to == vec![id(3)]
+        ));
+        assert_eq!(call.invite(id(1), &[id(3)]), Err(CallError::AlreadyInvited));
+    }
+
+    #[test]
+    fn invite_is_for_ongoing_calls_only() {
+        let (mut ringing, _) = Call::offer(CallId::from_bytes([4; 16]), id(1), vec![id(2)]);
+        assert!(matches!(
+            ringing.invite(id(1), &[id(3)]),
+            Err(CallError::Transition(_))
+        ));
+        let mut ended = active_call();
+        ended.hang_up().unwrap();
+        assert_eq!(ended.invite(id(1), &[id(3)]), Err(CallError::Ended));
+    }
+
+    #[test]
+    fn second_callee_of_a_group_ring_seats_after_the_first() {
+        let (mut call, _) = Call::offer(CallId::from_bytes([5; 16]), id(1), vec![id(2), id(3)]);
+        call.accept(id(2)).unwrap();
+        call.connected().unwrap();
+        call.accept(id(3)).unwrap();
+        assert_eq!(call.roster().len(), 3);
+        assert!(matches!(call.phase(), CallPhase::Active));
+    }
+
+    #[test]
+    fn one_of_two_ringing_callees_declining_keeps_the_ring_alive() {
+        let (mut call, _) = Call::offer(CallId::from_bytes([6; 16]), id(1), vec![id(2), id(3)]);
+        let events = call.decline(id(2)).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(call.phase(), CallPhase::Ringing { .. }));
+        // The last pending callee declining ends the ring.
+        let events = call.decline(id(3)).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            call.phase(),
+            CallPhase::Ended {
+                reason: EndReason::Declined,
+            }
+        ));
     }
 
     #[test]
