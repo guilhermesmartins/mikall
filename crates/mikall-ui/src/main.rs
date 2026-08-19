@@ -19,6 +19,7 @@ use iced::widget::{
 use iced::{Element, Fill, Font, Subscription, Task};
 
 use mikall_app::events::AppEvent;
+use mikall_app::ports::PeerAddr;
 use mikall_app::ports::{GatewayPort, IrcGatewayConfig};
 use mikall_app::services::{CallSnapshot, MemberView, RenderedMessage};
 use mikall_domain::calls::{CallEvent, CallId, CallPhase, CallRoster, EndReason, MediaState};
@@ -206,6 +207,8 @@ enum Msg {
     DialInput(String),
     DialSubmit,
     Dialed(Result<String, String>),
+    KnownPeersLoaded(Vec<PeerAddr>),
+    ForgetPeer(PeerAddr),
     CopyText(String),
     BlockedLoaded(Vec<(IdentityId, Option<Nickname>)>),
     Unblock(IdentityId),
@@ -273,6 +276,8 @@ struct Mikall {
     /// can dial us out of band when mDNS discovery is unavailable.
     listen_addrs: Vec<String>,
     dial_input: String,
+    /// Peers persisted for automatic redial at boot (settings → network).
+    known_peers: Vec<PeerAddr>,
     call: Option<CallUi>,
     /// Incoming offers that rang while another call surface was up; the
     /// next one is shown when the current call ends or is dismissed.
@@ -316,6 +321,7 @@ impl Mikall {
             alarm: None,
             listen_addrs: Vec::new(),
             dial_input: String::new(),
+            known_peers: Vec::new(),
             call: None,
             call_backlog: Vec::new(),
             ring_glow: false,
@@ -401,6 +407,16 @@ impl Mikall {
                     .collect()
             },
             Msg::ListenAddrsLoaded,
+        )
+    }
+
+    fn load_known_peers(&self) -> Task<Msg> {
+        let Some(node) = self.node() else {
+            return Task::none();
+        };
+        Task::perform(
+            async move { node.identity.known_peers().await },
+            Msg::KnownPeersLoaded,
         )
     }
 
@@ -759,7 +775,11 @@ impl Mikall {
                     pass_input: self.irc_cfg.password.clone().unwrap_or_default(),
                     export_armed: false,
                 });
-                Task::batch([self.load_blocked(), self.load_listen_addrs()])
+                Task::batch([
+                    self.load_blocked(),
+                    self.load_listen_addrs(),
+                    self.load_known_peers(),
+                ])
             }
             Msg::CloseSettings => {
                 self.settings = None;
@@ -796,9 +816,20 @@ impl Mikall {
             }
             Msg::Dialed(Ok(addr)) => {
                 self.alarm = Some(Alarm::Info {
-                    body: format!("connected — dialed {addr}"),
+                    body: format!("connected — dialed {addr} (remembered for next boot)"),
                 });
-                Task::none()
+                let Some(node) = self.node() else {
+                    return Task::none();
+                };
+                Task::perform(
+                    async move {
+                        if let Ok(peer) = PeerAddr::parse(&addr) {
+                            node.identity.remember_peer(peer).await;
+                        }
+                        node.identity.known_peers().await
+                    },
+                    Msg::KnownPeersLoaded,
+                )
             }
             Msg::Dialed(Err(error)) => {
                 self.alarm = Some(Alarm::Danger {
@@ -806,6 +837,22 @@ impl Mikall {
                     body: error,
                 });
                 Task::none()
+            }
+            Msg::KnownPeersLoaded(peers) => {
+                self.known_peers = peers;
+                Task::none()
+            }
+            Msg::ForgetPeer(peer) => {
+                let Some(node) = self.node() else {
+                    return Task::none();
+                };
+                Task::perform(
+                    async move {
+                        node.identity.forget_peer(&peer).await;
+                        node.identity.known_peers().await
+                    },
+                    Msg::KnownPeersLoaded,
+                )
             }
             Msg::CopyText(value) => iced::clipboard::write(value),
             Msg::BlockedLoaded(blocked) => {
@@ -2636,6 +2683,11 @@ impl Mikall {
                 .size(11)
                 .font(MONO)
                 .color(theme::MUTED),
+                Space::with_height(10),
+                text("remembered peers — redialed automatically at boot")
+                    .size(12)
+                    .color(theme::MUTED),
+                self.view_known_peers(),
             ]
             .spacing(6),
         )
@@ -2643,6 +2695,34 @@ impl Mikall {
         .padding([16, 20])
         .width(Fill)
         .into()
+    }
+
+    fn view_known_peers(&self) -> Element<'_, Msg> {
+        if self.known_peers.is_empty() {
+            return text("none yet — a successful connection is remembered here")
+                .size(11)
+                .font(MONO)
+                .color(theme::MUTED)
+                .into();
+        }
+        let mut list = Column::new().spacing(3);
+        for peer in &self.known_peers {
+            list = list.push(
+                row![
+                    text(peer.as_str().to_owned())
+                        .size(11)
+                        .font(MONO)
+                        .width(Fill),
+                    button(text("forget").size(10).font(MONO))
+                        .style(theme::ghost)
+                        .padding([2, 8])
+                        .on_press(Msg::ForgetPeer(peer.clone())),
+                ]
+                .spacing(8)
+                .align_y(iced::Center),
+            );
+        }
+        list.into()
     }
 
     fn view_settings_privacy() -> Element<'static, Msg> {
