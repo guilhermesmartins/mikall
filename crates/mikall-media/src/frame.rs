@@ -24,6 +24,10 @@ pub const FLAG_KEYFRAME: u8 = 0b0000_0010;
 pub enum MediaKind {
     Audio,
     Video,
+    /// In-band call control riding the media streams (forwarder
+    /// assignment, viewer feedback, keyframe requests). Sealed under the
+    /// same call key — control is exactly as authenticated as media.
+    Control,
 }
 
 impl MediaKind {
@@ -31,6 +35,7 @@ impl MediaKind {
         match self {
             MediaKind::Audio => 0,
             MediaKind::Video => 1,
+            MediaKind::Control => 2,
         }
     }
 
@@ -38,6 +43,7 @@ impl MediaKind {
         match byte {
             0 => Some(MediaKind::Audio),
             1 => Some(MediaKind::Video),
+            2 => Some(MediaKind::Control),
             _ => None,
         }
     }
@@ -133,6 +139,15 @@ pub fn seal(key: &CallKey, header: FrameHeader, payload: &[u8]) -> Result<Vec<u8
     out.extend_from_slice(&header_bytes);
     out.extend_from_slice(&ciphertext);
     Ok(out)
+}
+
+/// Read a sealed frame's plaintext header **without decrypting** — the
+/// relay's entire view of a frame. The header travels as AAD, so a
+/// tampered header fails [`open`] at every *viewer*; a forwarder routing
+/// on a peeked header never needs the call key, which is what makes
+/// forwarding sealed bytes safe by construction.
+pub fn peek_header(sealed: &[u8]) -> Result<FrameHeader, FrameError> {
+    FrameHeader::decode(sealed)
 }
 
 /// Authenticate and decrypt one frame.

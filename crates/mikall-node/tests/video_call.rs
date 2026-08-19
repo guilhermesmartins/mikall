@@ -20,7 +20,8 @@ use mikall_media::engine::{
 use mikall_media::frame::CallKey;
 use mikall_media::video::{
     run_video_receiver, run_video_sender, video_ssrc_of, CapturedFrame, DecodedPicture,
-    EncodedPicture, VideoDecoder, VideoEncoder, VideoError, VideoFanout, VideoSink,
+    EncodedPicture, VideoDecoder, VideoEncoder, VideoError, VideoFanout, VideoSenderControl,
+    VideoSink,
 };
 use mikall_net::NetConfig;
 use mikall_node::{start, NodeConfig, NodeHandle};
@@ -179,6 +180,7 @@ async fn video_rides_streams_while_voice_rides_the_old_path() {
                 &key,
                 ssrc,
                 10,
+                VideoSenderControl::new(1_500_000),
                 frame_rx,
                 Box::new(FakeEncoder { frames_seen: 0 }),
             )

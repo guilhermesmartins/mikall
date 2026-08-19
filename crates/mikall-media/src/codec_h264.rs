@@ -23,8 +23,13 @@ use crate::video::{
 
 /// Target bitrate: generous for 1280-wide screen content at 10 fps, small
 /// enough for a slow uplink to carry one copy (the whole point of sending
-/// each frame once).
-const TARGET_BITRATE_BPS: u32 = 1_500_000;
+/// each frame once). Also the *ceiling* of the feedback loop's adaptation.
+pub const TARGET_BITRATE_BPS: u32 = 1_500_000;
+
+/// Adaptation floor: below this, 1280-wide screen content stops being
+/// readable — a viewer that cannot carry it is better served by loss
+/// concealment than by soup.
+pub const MIN_BITRATE_BPS: u32 = 200_000;
 
 /// Safety-net IDR interval in frames (~15 s at 10 fps). Late joiners get
 /// an immediate forced IDR through the fan-out; this only bounds how long
@@ -36,6 +41,8 @@ pub struct H264Encoder {
     encoder: Encoder,
     yuv: Option<YUVBuffer>,
     fps: u32,
+    bitrate_bps: u32,
+    pending_bitrate_bps: Option<u32>,
 }
 
 impl std::fmt::Debug for H264Encoder {
@@ -46,20 +53,29 @@ impl std::fmt::Debug for H264Encoder {
 
 impl H264Encoder {
     pub fn new(fps: u32) -> Result<Self, VideoError> {
+        Self::with_bitrate(fps, TARGET_BITRATE_BPS)
+    }
+
+    pub fn with_bitrate(fps: u32, bitrate_bps: u32) -> Result<Self, VideoError> {
+        Ok(H264Encoder {
+            encoder: Self::build(fps, bitrate_bps)?,
+            yuv: None,
+            fps,
+            bitrate_bps,
+            pending_bitrate_bps: None,
+        })
+    }
+
+    fn build(fps: u32, bitrate_bps: u32) -> Result<Encoder, VideoError> {
         let config = EncoderConfig::new()
             .usage_type(UsageType::ScreenContentRealTime)
             .max_frame_rate(FrameRate::from_hz(fps.max(1) as f32))
-            .bitrate(BitRate::from_bps(TARGET_BITRATE_BPS))
+            .bitrate(BitRate::from_bps(bitrate_bps))
             .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(
                 INTRA_PERIOD_FRAMES,
             ));
-        let encoder = Encoder::with_api_config(OpenH264API::from_source(), config)
-            .map_err(|e| VideoError::Encode(e.to_string()))?;
-        Ok(H264Encoder {
-            encoder,
-            yuv: None,
-            fps,
-        })
+        Encoder::with_api_config(OpenH264API::from_source(), config)
+            .map_err(|e| VideoError::Encode(e.to_string()))
     }
 }
 
@@ -71,6 +87,22 @@ impl VideoEncoder for H264Encoder {
     ) -> Result<Option<EncodedPicture>, VideoError> {
         if frame.width == 0 || frame.height == 0 || frame.bgra.is_empty() {
             return Err(VideoError::BadDimensions(frame.width, frame.height));
+        }
+        // Bitrate retarget (feedback loop): the crate exposes no safe
+        // runtime rate-control setter, so the encoder is rebuilt with the
+        // new target. Milliseconds of work at the adaptation cadence
+        // (cooldown-limited to once per several seconds), and the fresh
+        // encoder's first frame is an IDR — which every lane accepts as a
+        // new run, so the switch is seamless by construction.
+        if let Some(bps) = self.pending_bitrate_bps.take() {
+            if bps != self.bitrate_bps {
+                self.encoder = Self::build(self.fps, bps)?;
+                self.bitrate_bps = bps;
+                tracing::info!(
+                    bitrate_bps = bps,
+                    "video tx: encoder rebuilt at new bitrate"
+                );
+            }
         }
         // Normalize: the weak-machine width cap, then even dimensions.
         let shaped = crop_to_even(downscale_to_max_width(frame.clone(), MAX_WIDTH));
@@ -105,8 +137,11 @@ impl VideoEncoder for H264Encoder {
         if bytes.is_empty() {
             return Ok(None);
         }
-        let _ = self.fps; // recorded for future rate adaptation
         Ok(Some(EncodedPicture { bytes, keyframe }))
+    }
+
+    fn set_target_bitrate(&mut self, bps: u32) {
+        self.pending_bitrate_bps = Some(bps);
     }
 }
 
@@ -213,6 +248,31 @@ mod tests {
         let _ = encoder.encode(&frame, false).unwrap().unwrap();
         let forced = encoder.encode(&frame, true).unwrap().unwrap();
         assert!(forced.keyframe, "force_keyframe must produce an IDR");
+    }
+
+    #[test]
+    fn bitrate_retarget_rebuilds_and_opens_with_an_idr() {
+        let mut encoder = H264Encoder::new(10).unwrap();
+        let mut decoder = H264Decoder::new().unwrap();
+        let frame = gradient(320, 180);
+        let _ = encoder.encode(&frame, false).unwrap().unwrap();
+        let delta = encoder.encode(&frame, false).unwrap();
+        assert!(delta.is_none_or(|p| !p.keyframe));
+
+        encoder.set_target_bitrate(400_000);
+        let after = encoder.encode(&frame, false).unwrap().unwrap();
+        assert!(
+            after.keyframe,
+            "a rebuilt encoder must open with an IDR so every lane resyncs"
+        );
+        assert!(decoder.decode(&after.bytes).is_some());
+
+        // Setting the same bitrate again must not force another IDR.
+        encoder.set_target_bitrate(400_000);
+        let mut second_frame = frame.clone();
+        second_frame.bgra[0] = 111;
+        let steady = encoder.encode(&second_frame, false).unwrap();
+        assert!(steady.is_none_or(|p| !p.keyframe));
     }
 
     #[test]

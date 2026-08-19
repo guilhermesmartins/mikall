@@ -138,6 +138,8 @@ mod engine {
             | CallEvent::ScreenShareStopped { call, .. }
             | CallEvent::MicMuted { call, .. }
             | CallEvent::MicUnmuted { call, .. }
+            | CallEvent::ForwarderElected { call, .. }
+            | CallEvent::ForwarderCleared { call, .. }
             | CallEvent::CallEnded { call, .. } => *call,
         }
     }

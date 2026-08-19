@@ -374,6 +374,40 @@ async fn callee_accepts(world: &mut MikallWorld) {
     world.node(&node).calls.accept(call, callee).await.unwrap();
 }
 
+#[when(expr = "{string} shares the screen in the call")]
+async fn shares_screen(world: &mut MikallWorld, who: String) {
+    let call = world.call.unwrap();
+    let me = world.id_of(&who);
+    let calls = &world.node(&who).calls;
+    calls.set_screen_sharing(call, me, true).await.unwrap();
+    // The sharer's node runs the election (deterministic v1 strategy).
+    calls.reconcile_forwarder(call, &[]).await.unwrap();
+}
+
+#[when(expr = "{string} stops sharing the screen")]
+async fn stops_sharing(world: &mut MikallWorld, who: String) {
+    let call = world.call.unwrap();
+    let me = world.id_of(&who);
+    let calls = &world.node(&who).calls;
+    calls.set_screen_sharing(call, me, false).await.unwrap();
+    calls.reconcile_forwarder(call, &[]).await.unwrap();
+}
+
+#[when(expr = "the forwarder leaves the call")]
+async fn forwarder_leaves(world: &mut MikallWorld) {
+    let call = world.call.unwrap();
+    let node = world.call_node.clone().unwrap();
+    let calls = Arc::clone(&world.node(&node).calls);
+    let snapshot = calls.snapshot(call).await.unwrap();
+    let (_, forwarder) = *snapshot
+        .forwarders
+        .first()
+        .expect("a forwarder must be elected before it can leave");
+    calls.leave(call, forwarder).await.unwrap();
+    // The sharer notices (ForwarderCleared) and re-runs the election.
+    calls.reconcile_forwarder(call, &[]).await.unwrap();
+}
+
 #[when(expr = "{string} accepts the transfer")]
 async fn accepts_transfer(world: &mut MikallWorld, who: String) {
     let id = world.transfer.unwrap();
@@ -674,6 +708,38 @@ async fn accept_again_rejected(world: &mut MikallWorld) {
     let extra = MikallWorld::synthetic_id("callpeer", 251);
     let result = world.node(&node).calls.accept(call, extra).await;
     assert!(matches!(result, Err(CallServiceError::Call(_))));
+}
+
+#[then(expr = "the elected forwarder is the lowest-identity non-sharer peer")]
+async fn elected_lowest(world: &mut MikallWorld) {
+    let call = world.call.unwrap();
+    let node = world.call_node.clone().unwrap();
+    let sharer = world.id_of(&node);
+    let snapshot = world.node(&node).calls.snapshot(call).await.unwrap();
+    let expected = snapshot
+        .participants
+        .iter()
+        .map(|(who, _)| *who)
+        .filter(|who| *who != sharer)
+        .min()
+        .expect("at least one non-sharer peer");
+    assert_eq!(
+        snapshot.forwarders,
+        vec![(sharer, expected)],
+        "deterministic election: lowest seated non-sharer identity"
+    );
+}
+
+#[then(expr = "no forwarder is elected and the sharer fans out directly")]
+async fn no_forwarder(world: &mut MikallWorld) {
+    let call = world.call.unwrap();
+    let node = world.call_node.clone().unwrap();
+    let snapshot = world.node(&node).calls.snapshot(call).await.unwrap();
+    assert!(
+        snapshot.forwarders.is_empty(),
+        "expected direct fan-out, got {:?}",
+        snapshot.forwarders
+    );
 }
 
 #[then(expr = "the transfer is complete")]

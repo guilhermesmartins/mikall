@@ -146,6 +146,9 @@ struct ShareFrame {
     handle: iced::widget::image::Handle,
     width: u32,
     height: u32,
+    /// The peer that relayed this picture to us, when the sharer's frames
+    /// arrive through an elected forwarder rather than directly.
+    via: Option<IdentityId>,
 }
 
 /// The abortable accept-loop of a running gateway. `mikall_irc::serve`
@@ -630,6 +633,8 @@ impl Mikall {
             | CallEvent::ScreenShareStopped { call, .. }
             | CallEvent::MicMuted { call, .. }
             | CallEvent::MicUnmuted { call, .. }
+            | CallEvent::ForwarderElected { call, .. }
+            | CallEvent::ForwarderCleared { call, .. }
             | CallEvent::CallEnded { call, .. } => *call,
         }
     }
@@ -1232,6 +1237,7 @@ impl Mikall {
                                 ),
                                 width: frame.width,
                                 height: frame.height,
+                                via: frame.via,
                             },
                         );
                     }
@@ -1909,7 +1915,19 @@ impl Mikall {
         };
         let frame = self.call.as_ref().and_then(|call| call.frames.get(&peer));
         let live = frame
-            .map(|f| format!("is sharing their screen — live, {}×{}", f.width, f.height))
+            .map(|f| {
+                // Honest routing: pixels carried by an elected forwarder
+                // say so — "via <peer>" — pixels straight from the sharer
+                // don't pretend there was one.
+                let via = f
+                    .via
+                    .map(|relay| format!(" · via {}", self.peer_label(relay).0))
+                    .unwrap_or_default();
+                format!(
+                    "is sharing their screen — live, {}×{}{via}",
+                    f.width, f.height
+                )
+            })
             .unwrap_or_else(|| "is sharing their screen".to_owned());
         let header = row![
             text("SCREEN SHARE")

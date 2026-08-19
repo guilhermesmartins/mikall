@@ -8,7 +8,10 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, RwLock};
 
-use mikall_domain::calls::{Call, CallError, CallEvent, CallId, CallPhase, MediaState};
+use mikall_domain::calls::{
+    Call, CallError, CallEvent, CallId, CallPhase, ForwarderStrategy, LowestSeatedIdentity,
+    MediaState,
+};
 use mikall_domain::shared::IdentityId;
 
 use crate::events::EventBus;
@@ -36,6 +39,10 @@ pub struct CallSnapshot {
     /// Offered-but-not-joined: rung (initially or mid-call) and yet to
     /// answer. Frontends render these as "ringing" and must not re-ring.
     pub invited: Vec<IdentityId>,
+    /// Elected (sharer, forwarder) pairs. Populated on the node that runs
+    /// the election (the sharer's — its roster view is authoritative for
+    /// its own share); remotes learn their role in-band.
+    pub forwarders: Vec<(IdentityId, IdentityId)>,
 }
 
 type MediaTap = mpsc::Sender<(IdentityId, Vec<u8>)>;
@@ -50,6 +57,8 @@ pub struct CallService {
     media_taps: Arc<RwLock<BTreeMap<CallId, MediaTap>>>,
     video_taps: Arc<RwLock<BTreeMap<CallId, MediaTap>>>,
     call_keys: Arc<RwLock<BTreeMap<CallId, [u8; 32]>>>,
+    /// Forwarder election policy — v1 deterministic; scoring lands here.
+    forwarder_strategy: Arc<dyn ForwarderStrategy>,
 }
 
 impl std::fmt::Debug for CallService {
@@ -74,6 +83,7 @@ impl CallService {
             media_taps: Arc::new(RwLock::new(BTreeMap::new())),
             video_taps: Arc::new(RwLock::new(BTreeMap::new())),
             call_keys: Arc::new(RwLock::new(BTreeMap::new())),
+            forwarder_strategy: Arc::new(LowestSeatedIdentity),
         }
     }
 
@@ -215,7 +225,7 @@ impl CallService {
     /// Toggle our screen share and tell the call.
     pub async fn share_screen(&self, id: CallId, active: bool) -> Result<(), CallServiceError> {
         let me = self.identity.local_id();
-        let (event, peers) = {
+        let (events, peers) = {
             let mut calls = self.calls.write().await;
             let call = calls.get_mut(&id).ok_or(CallServiceError::UnknownCall)?;
             let peers: Vec<IdentityId> = call
@@ -226,7 +236,9 @@ impl CallService {
                 .collect();
             (call.set_screen_sharing(me, active)?, peers)
         };
-        self.bus.publish_domain(event);
+        for event in events {
+            self.bus.publish_domain(event);
+        }
         for peer in peers {
             let _ = self
                 .signaling
@@ -234,6 +246,66 @@ impl CallService {
                 .await;
         }
         Ok(())
+    }
+
+    /// Re-derive who forwards *our* share, keeping a valid incumbent
+    /// (stability beats optimality — a working forwarder is never swapped
+    /// just because a lower identity joined). `unreachable` names peers
+    /// the transport currently reports failing — the v1 stand-in for the
+    /// reachability input of real forwarder scoring. Returns the forwarder
+    /// in force after reconciliation; `None` means the sharer fans out
+    /// directly, exactly as before the forwarding tree existed.
+    pub async fn reconcile_forwarder(
+        &self,
+        id: CallId,
+        unreachable: &[IdentityId],
+    ) -> Result<Option<IdentityId>, CallServiceError> {
+        let me = self.identity.local_id();
+        let mut events: Vec<CallEvent> = Vec::new();
+        let result = {
+            let mut calls = self.calls.write().await;
+            let call = calls.get_mut(&id).ok_or(CallServiceError::UnknownCall)?;
+            let i_am_sharing = call
+                .roster()
+                .members()
+                .any(|(who, media)| who == me && media.sharing_screen);
+            if !i_am_sharing {
+                events.extend(call.clear_forwarder(&me));
+                None
+            } else {
+                let candidates: Vec<IdentityId> = call
+                    .forwarder_candidates(&me)
+                    .into_iter()
+                    .filter(|peer| !unreachable.contains(peer))
+                    .collect();
+                let incumbent = call
+                    .forwarder_for(&me)
+                    .filter(|current| candidates.contains(current));
+                match incumbent {
+                    Some(keep) => Some(keep),
+                    None => {
+                        events.extend(call.clear_forwarder(&me));
+                        match self.forwarder_strategy.pick(&candidates) {
+                            Some(choice) => {
+                                events.push(call.elect_forwarder(me, choice)?);
+                                Some(choice)
+                            }
+                            None => None,
+                        }
+                    }
+                }
+            }
+        };
+        for event in events {
+            self.bus.publish_domain(event);
+        }
+        Ok(result)
+    }
+
+    /// The forwarder currently elected for `sharer`'s share, if any.
+    pub async fn forwarder_of(&self, id: CallId, sharer: IdentityId) -> Option<IdentityId> {
+        let calls = self.calls.read().await;
+        calls.get(&id).and_then(|call| call.forwarder_for(&sharer))
     }
 
     /// Toggle our mic mute and tell the call. The enforcement is local —
@@ -328,8 +400,8 @@ impl CallService {
                 }
                 CallAction::ScreenShare { active } => {
                     if let Some(call) = calls.get_mut(&id) {
-                        if let Ok(event) = call.set_screen_sharing(from, active) {
-                            events.push(event);
+                        if let Ok(mut share_events) = call.set_screen_sharing(from, active) {
+                            events.append(&mut share_events);
                         }
                     }
                 }
@@ -465,12 +537,14 @@ impl CallService {
         who: IdentityId,
         sharing: bool,
     ) -> Result<(), CallServiceError> {
-        let event = {
+        let events = {
             let mut calls = self.calls.write().await;
             let call = calls.get_mut(&id).ok_or(CallServiceError::UnknownCall)?;
             call.set_screen_sharing(who, sharing)?
         };
-        self.bus.publish_domain(event);
+        for event in events {
+            self.bus.publish_domain(event);
+        }
         Ok(())
     }
 
@@ -483,6 +557,7 @@ impl CallService {
             phase: call.phase().clone(),
             participants: call.roster().members().collect(),
             invited: call.invited().collect(),
+            forwarders: call.forwarders().collect(),
         })
     }
 }

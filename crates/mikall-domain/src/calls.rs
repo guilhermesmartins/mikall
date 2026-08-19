@@ -125,6 +125,37 @@ impl CallRoster {
     }
 }
 
+/// Forwarder election policy — the strategy seam of the forwarding tree.
+///
+/// A forwarder is a *peer role*, never a server: one seated participant
+/// relays the sharer's sealed frames so the sharer uplinks each frame
+/// exactly once regardless of viewer count. v1 picks deterministically;
+/// real scoring (uplink bandwidth, CPU headroom, public reachability)
+/// replaces the implementation behind this same trait.
+pub trait ForwarderStrategy: Send + Sync {
+    /// Choose a forwarder among `candidates` — the seated, non-sharer
+    /// peers, in roster (identity) order. `None` means nobody is worth
+    /// electing and the sharer fans out directly.
+    fn pick(&self, candidates: &[IdentityId]) -> Option<IdentityId>;
+}
+
+/// v1 election: the **lowest identity among seated non-sharer peers** —
+/// deterministic, stable across machines, and re-derivable from roster
+/// state alone. Only elects when the forwarder would offload at least one
+/// *other* viewer: with fewer than two candidates, direct fan-out costs
+/// the sharer the same single uplink, so a forwarder is pure overhead.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LowestSeatedIdentity;
+
+impl ForwarderStrategy for LowestSeatedIdentity {
+    fn pick(&self, candidates: &[IdentityId]) -> Option<IdentityId> {
+        if candidates.len() < 2 {
+            return None;
+        }
+        candidates.iter().min().copied()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndReason {
     HungUp,
@@ -268,6 +299,20 @@ pub enum CallEvent {
         call: CallId,
         who: IdentityId,
     },
+    /// A seated peer was elected to forward `sharer`'s stream: the sharer
+    /// sends each sealed frame once to the forwarder, who fans out.
+    ForwarderElected {
+        call: CallId,
+        sharer: IdentityId,
+        forwarder: IdentityId,
+    },
+    /// `sharer`'s share no longer has a forwarder (the forwarder or the
+    /// sharer left, or the share stopped). Until a re-election lands, the
+    /// sharer fans out directly — a cleared forwarder never ends a share.
+    ForwarderCleared {
+        call: CallId,
+        sharer: IdentityId,
+    },
     CallEnded {
         call: CallId,
         reason: EndReason,
@@ -291,6 +336,12 @@ pub enum CallError {
         max = CallRoster::MAX_PARTICIPANTS
     )]
     NoFreeSeat { seated: usize, pending: usize },
+    #[error("peer is not sharing their screen")]
+    NotSharing,
+    #[error("a forwarder must be seated in the call")]
+    ForwarderNotSeated,
+    #[error("the sharer cannot forward their own stream")]
+    ForwarderIsSharer,
 }
 
 /// The `Call` aggregate.
@@ -306,6 +357,13 @@ pub struct Call {
     /// Opened with nobody to ring: the opener holds the stage alone by
     /// choice, so "last participant left" never fires while they stay.
     solo_stage: bool,
+    /// Per-sharer elected forwarder (sharer → forwarder). Entries exist
+    /// only while both parties are seated and the sharer is sharing —
+    /// [`Call::elect_forwarder`] refuses anything else, and [`Call::leave`]
+    /// / [`Call::set_screen_sharing`] clear entries the moment either
+    /// party departs or the share stops. A forwarder that isn't seated,
+    /// or a sharer forwarding their own stream, is unrepresentable.
+    forwarders: BTreeMap<IdentityId, IdentityId>,
     phase: CallPhase,
 }
 
@@ -326,6 +384,7 @@ impl Call {
             roster: CallRoster::solo(initiator),
             invited: offered_to.iter().copied().collect(),
             solo_stage: false,
+            forwarders: BTreeMap::new(),
             phase: CallPhase::Ringing {
                 offered_to: offered_to.clone(),
             },
@@ -347,6 +406,7 @@ impl Call {
             roster: CallRoster::solo(initiator),
             invited: BTreeSet::new(),
             solo_stage: true,
+            forwarders: BTreeMap::new(),
             phase: CallPhase::Active,
         };
         let event = CallEvent::CallOpened {
@@ -515,6 +575,22 @@ impl Call {
     pub fn leave(&mut self, who: IdentityId) -> Result<Vec<CallEvent>, CallError> {
         self.roster.remove(&who)?;
         let mut events = vec![CallEvent::ParticipantLeft { call: self.id, who }];
+        // Forwarding entries never outlive their parties: the leaver's own
+        // share loses its forwarder, and every share the leaver forwarded
+        // falls back to direct fan-out until a re-election lands.
+        let orphaned: Vec<IdentityId> = self
+            .forwarders
+            .iter()
+            .filter(|(sharer, forwarder)| **sharer == who || **forwarder == who)
+            .map(|(sharer, _)| *sharer)
+            .collect();
+        for sharer in orphaned {
+            self.forwarders.remove(&sharer);
+            events.push(CallEvent::ForwarderCleared {
+                call: self.id,
+                sharer,
+            });
+        }
         // On a solo stage the opener alone is not "last participant left":
         // staying is their choice, hanging up is how they end it.
         let opener_holds_the_stage =
@@ -539,6 +615,9 @@ impl Call {
 
     pub fn hang_up(&mut self) -> Result<CallEvent, CallError> {
         self.transition(CallPhase::hang_up)?;
+        // The call is over; forwarding roles end with it (no per-share
+        // events — CallEnded says everything).
+        self.forwarders.clear();
         Ok(CallEvent::CallEnded {
             call: self.id,
             reason: EndReason::HungUp,
@@ -549,21 +628,96 @@ impl Call {
         &mut self,
         who: IdentityId,
         sharing: bool,
-    ) -> Result<CallEvent, CallError> {
+    ) -> Result<Vec<CallEvent>, CallError> {
         match self.phase {
             CallPhase::Active => {
                 self.roster
                     .update_media(&who, |m| m.sharing_screen = sharing)?;
-                Ok(if sharing {
+                let mut events = vec![if sharing {
                     CallEvent::ScreenShareStarted { call: self.id, who }
                 } else {
                     CallEvent::ScreenShareStopped { call: self.id, who }
-                })
+                }];
+                // A stopped share cannot keep its forwarder: the role only
+                // exists while the sharer is sharing.
+                if !sharing && self.forwarders.remove(&who).is_some() {
+                    events.push(CallEvent::ForwarderCleared {
+                        call: self.id,
+                        sharer: who,
+                    });
+                }
+                Ok(events)
             }
             CallPhase::Ringing { .. } | CallPhase::Connecting | CallPhase::Ended { .. } => {
                 Err(CallError::Ended)
             }
         }
+    }
+
+    /// The forwarder currently elected for `sharer`'s share, if any.
+    pub fn forwarder_for(&self, sharer: &IdentityId) -> Option<IdentityId> {
+        self.forwarders.get(sharer).copied()
+    }
+
+    /// All (sharer, forwarder) pairs in force.
+    pub fn forwarders(&self) -> impl Iterator<Item = (IdentityId, IdentityId)> + '_ {
+        self.forwarders.iter().map(|(s, f)| (*s, *f))
+    }
+
+    /// Peers eligible to forward `sharer`'s stream: everyone seated but
+    /// the sharer, in roster (identity) order — the deterministic input a
+    /// [`ForwarderStrategy`] picks from.
+    pub fn forwarder_candidates(&self, sharer: &IdentityId) -> Vec<IdentityId> {
+        self.roster
+            .members()
+            .map(|(who, _)| who)
+            .filter(|who| who != sharer)
+            .collect()
+    }
+
+    /// Install `forwarder` for `sharer`'s share. The invariants are the
+    /// constructor: an entry violating them cannot exist. The election
+    /// *policy* (which candidate) is the caller's [`ForwarderStrategy`];
+    /// this method only guards representability.
+    pub fn elect_forwarder(
+        &mut self,
+        sharer: IdentityId,
+        forwarder: IdentityId,
+    ) -> Result<CallEvent, CallError> {
+        if !matches!(self.phase, CallPhase::Active) {
+            return Err(CallError::Ended);
+        }
+        let sharer_is_sharing = self
+            .roster
+            .members()
+            .any(|(who, media)| who == sharer && media.sharing_screen);
+        if !sharer_is_sharing {
+            return Err(CallError::NotSharing);
+        }
+        if forwarder == sharer {
+            return Err(CallError::ForwarderIsSharer);
+        }
+        if !self.roster.contains(&forwarder) {
+            return Err(CallError::ForwarderNotSeated);
+        }
+        self.forwarders.insert(sharer, forwarder);
+        Ok(CallEvent::ForwarderElected {
+            call: self.id,
+            sharer,
+            forwarder,
+        })
+    }
+
+    /// Drop `sharer`'s forwarder (share stopping, forwarder unreachable,
+    /// re-election under way). Returns the event when there was one to
+    /// clear; clearing nothing is not an error.
+    pub fn clear_forwarder(&mut self, sharer: &IdentityId) -> Option<CallEvent> {
+        self.forwarders
+            .remove(sharer)
+            .map(|_| CallEvent::ForwarderCleared {
+                call: self.id,
+                sharer: *sharer,
+            })
     }
 
     /// A participant's mic mute state changed (their own choice — nobody
@@ -763,8 +917,116 @@ mod tests {
         assert_eq!(call.set_screen_sharing(id(1), true), Err(CallError::Ended));
         call.accept(id(2)).unwrap();
         call.connected().unwrap();
-        let event = call.set_screen_sharing(id(1), true).unwrap();
-        assert!(matches!(event, CallEvent::ScreenShareStarted { .. }));
+        let events = call.set_screen_sharing(id(1), true).unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [CallEvent::ScreenShareStarted { .. }]
+        ));
+    }
+
+    /// A 3+-party call sharing elects the lowest seated non-sharer
+    /// identity — deterministically, and never the sharer.
+    #[test]
+    fn election_is_deterministic_and_excludes_the_sharer() {
+        let mut call = active_call();
+        call.join(id(3)).unwrap();
+        call.set_screen_sharing(id(2), true).unwrap();
+        let candidates = call.forwarder_candidates(&id(2));
+        assert_eq!(candidates, vec![id(1), id(3)]);
+        let choice = LowestSeatedIdentity.pick(&candidates).unwrap();
+        assert_eq!(choice, id(1), "lowest identity among non-sharer peers");
+        let event = call.elect_forwarder(id(2), choice).unwrap();
+        assert!(matches!(
+            event,
+            CallEvent::ForwarderElected { sharer, forwarder, .. }
+                if sharer == id(2) && forwarder == id(1)
+        ));
+        assert_eq!(call.forwarder_for(&id(2)), Some(id(1)));
+    }
+
+    /// With fewer than two candidates a forwarder is pure overhead: the
+    /// strategy refuses, and direct fan-out (M16 behavior) remains.
+    #[test]
+    fn two_party_call_elects_nobody() {
+        let mut call = active_call();
+        call.set_screen_sharing(id(1), true).unwrap();
+        let candidates = call.forwarder_candidates(&id(1));
+        assert_eq!(candidates, vec![id(2)]);
+        assert_eq!(LowestSeatedIdentity.pick(&candidates), None);
+        assert_eq!(call.forwarder_for(&id(1)), None);
+    }
+
+    /// Invalid forwarders are unrepresentable: not-seated, the sharer
+    /// itself, a non-sharing sharer — all refused at the constructor.
+    #[test]
+    fn invalid_forwarders_are_unrepresentable() {
+        let mut call = active_call();
+        call.join(id(3)).unwrap();
+        // Sharer not sharing yet.
+        assert_eq!(
+            call.elect_forwarder(id(2), id(1)),
+            Err(CallError::NotSharing)
+        );
+        call.set_screen_sharing(id(2), true).unwrap();
+        // A stranger cannot forward.
+        assert_eq!(
+            call.elect_forwarder(id(2), id(9)),
+            Err(CallError::ForwarderNotSeated)
+        );
+        // The sharer cannot forward their own stream.
+        assert_eq!(
+            call.elect_forwarder(id(2), id(2)),
+            Err(CallError::ForwarderIsSharer)
+        );
+        assert_eq!(call.forwarder_for(&id(2)), None);
+    }
+
+    /// The forwarder leaving clears the role (the share survives, direct
+    /// fan-out resumes until re-election); the sharer leaving clears it
+    /// too.
+    #[test]
+    fn leaving_clears_forwarding_both_ways() {
+        let mut call = active_call();
+        call.join(id(3)).unwrap();
+        call.join(id(4)).unwrap();
+        call.set_screen_sharing(id(2), true).unwrap();
+        call.elect_forwarder(id(2), id(1)).unwrap();
+
+        let events = call.leave(id(1)).unwrap();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            CallEvent::ForwarderCleared { sharer, .. } if *sharer == id(2)
+        )));
+        assert_eq!(call.forwarder_for(&id(2)), None);
+
+        // Re-election over the survivors, then the sharer leaves.
+        let candidates = call.forwarder_candidates(&id(2));
+        assert_eq!(candidates, vec![id(3), id(4)]);
+        call.elect_forwarder(id(2), id(3)).unwrap();
+        let events = call.leave(id(2)).unwrap();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            CallEvent::ForwarderCleared { sharer, .. } if *sharer == id(2)
+        )));
+        assert_eq!(call.forwarder_for(&id(2)), None);
+    }
+
+    /// Stopping the share retires its forwarder with it.
+    #[test]
+    fn stopping_the_share_clears_the_forwarder() {
+        let mut call = active_call();
+        call.join(id(3)).unwrap();
+        call.set_screen_sharing(id(2), true).unwrap();
+        call.elect_forwarder(id(2), id(1)).unwrap();
+        let events = call.set_screen_sharing(id(2), false).unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                CallEvent::ScreenShareStopped { .. },
+                CallEvent::ForwarderCleared { .. }
+            ]
+        ));
+        assert_eq!(call.forwarder_for(&id(2)), None);
     }
 
     #[test]

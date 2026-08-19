@@ -14,8 +14,15 @@
 //! - [`video`]: the screen-share pipeline — static-frame gate, one
 //!   encode + one seal per frame, per-viewer latest-run-wins lanes over
 //!   unidirectional media streams ([`VideoFanout`](video::VideoFanout) is
-//!   the fan-out seam the forwarding tree will replace), and the ordered
-//!   per-sender receive path. Pure and fake-codec-testable.
+//!   the single fan-out point, now with the relay keyframe-run cache),
+//!   and the ordered per-sender receive path. Pure and fake-codec-testable.
+//! - [`relay`]: the per-call video pump — routes inbound sealed frames to
+//!   the decoder, the forwarder relay (sealed bytes only, zero
+//!   decryption), and the control handler; counts the viewer's feedback
+//!   windows.
+//! - [`control`]: in-band call control (forwarder assignment, viewer
+//!   feedback, keyframe requests) as sealed [`frame`] payloads, plus the
+//!   sharer's loss-based [`BitrateController`](control::BitrateController).
 //! - [`capture`] / [`codec_h264`] (feature `hardware-video`): the scap
 //!   screen-capture adapter and the OpenH264 encoder/decoder over the
 //!   [`video`] ports.
@@ -25,10 +32,12 @@
 //! different by design (docs/streaming.md): one encode, per-viewer lanes,
 //! stale frames dropped in whole runs.
 
+pub mod control;
 pub mod engine;
 pub mod frame;
 pub mod jitter;
 pub mod pcm;
+pub mod relay;
 pub mod video;
 
 #[cfg(feature = "hardware-audio")]

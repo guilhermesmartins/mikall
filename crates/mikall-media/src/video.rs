@@ -18,7 +18,7 @@
 //!   not single frames, and asks the shared encoder for an IDR.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{mpsc, Notify};
@@ -139,6 +139,11 @@ pub trait VideoEncoder: Send {
         frame: &CapturedFrame,
         force_keyframe: bool,
     ) -> Result<Option<EncodedPicture>, VideoError>;
+
+    /// Retarget the encoder's bitrate (the feedback loop's actuator).
+    /// Takes effect on a following frame; codecs that cannot adapt ignore
+    /// it — the default is an honest no-op.
+    fn set_target_bitrate(&mut self, _bps: u32) {}
 }
 
 /// The codec's decode port. `None` = not decodable (waiting for state,
@@ -206,6 +211,11 @@ pub struct VideoSendQueue {
     capacity: usize,
     awaiting_keyframe: bool,
     dropped: u64,
+    /// Frames still in the queue from a [`VideoSendQueue::prime`]: a
+    /// primed backlog (a whole cached keyframe run) may exceed the
+    /// steady-state capacity, so the overflow check allows it through
+    /// until the lane drains it.
+    primed: usize,
 }
 
 impl VideoSendQueue {
@@ -215,6 +225,7 @@ impl VideoSendQueue {
             capacity: capacity.max(1),
             awaiting_keyframe: true,
             dropped: 0,
+            primed: 0,
         }
     }
 
@@ -223,9 +234,10 @@ impl VideoSendQueue {
             self.dropped += 1;
             return PushOutcome::SkippedAwaitingKeyframe;
         }
-        if self.frames.len() >= self.capacity {
+        if self.frames.len() >= self.capacity + self.primed {
             let dropped = self.frames.len() + 1;
             self.frames.clear();
+            self.primed = 0;
             self.dropped += dropped as u64;
             self.awaiting_keyframe = true;
             if frame.keyframe {
@@ -246,8 +258,30 @@ impl VideoSendQueue {
         PushOutcome::Queued
     }
 
+    /// Seed a fresh lane with a complete cached keyframe run (keyframe
+    /// first — the caller guarantees run shape). The late joiner gets a
+    /// decodable picture *now*, from the cache, without the sharer
+    /// re-encoding an IDR.
+    pub fn prime(&mut self, run: &[SealedVideoFrame]) {
+        let Some(first) = run.first() else {
+            return;
+        };
+        if !first.keyframe {
+            return;
+        }
+        self.dropped += self.frames.len() as u64;
+        self.frames.clear();
+        self.frames.extend(run.iter().cloned());
+        self.primed = self.frames.len();
+        self.awaiting_keyframe = false;
+    }
+
     pub fn pop(&mut self) -> Option<SealedVideoFrame> {
-        self.frames.pop_front()
+        let popped = self.frames.pop_front();
+        if popped.is_some() {
+            self.primed = self.primed.saturating_sub(1);
+        }
+        popped
     }
 
     /// A keyframe is needed before this queue will carry frames again.
@@ -260,6 +294,7 @@ impl VideoSendQueue {
     pub fn reset_for_keyframe(&mut self) {
         self.dropped += self.frames.len() as u64;
         self.frames.clear();
+        self.primed = 0;
         self.awaiting_keyframe = true;
     }
 
@@ -276,6 +311,65 @@ impl VideoSendQueue {
     }
 }
 
+/// Cache of the last complete keyframe *run* (the keyframe plus every
+/// delta since — H.264 deltas chain, so anything less than the whole run
+/// cannot prime a decoder). Lives beside the lane queues on relay
+/// fan-outs: a late-joining viewer's lane is primed from here instead of
+/// making the sharer re-encode an IDR. Byte-capped: a run that outgrows
+/// the cap is discarded whole (a partial run would decode to garbage) and
+/// the next keyframe starts a fresh one.
+#[derive(Debug)]
+pub struct KeyframeCache {
+    run: Vec<SealedVideoFrame>,
+    bytes: usize,
+    max_bytes: usize,
+    complete: bool,
+}
+
+impl KeyframeCache {
+    pub fn new(max_bytes: usize) -> Self {
+        KeyframeCache {
+            run: Vec::new(),
+            bytes: 0,
+            max_bytes,
+            complete: false,
+        }
+    }
+
+    pub fn observe(&mut self, frame: &SealedVideoFrame) {
+        if frame.keyframe {
+            self.run.clear();
+            self.bytes = frame.sealed.len();
+            self.run.push(frame.clone());
+            // A single keyframe always fits by definition — without it
+            // there is nothing to serve at all.
+            self.complete = true;
+            return;
+        }
+        if !self.complete {
+            return;
+        }
+        if self.bytes + frame.sealed.len() > self.max_bytes {
+            self.run.clear();
+            self.bytes = 0;
+            self.complete = false;
+            return;
+        }
+        self.bytes += frame.sealed.len();
+        self.run.push(frame.clone());
+    }
+
+    /// The complete run, keyframe first — or `None` when the cache cannot
+    /// honestly serve a decodable picture.
+    pub fn run(&self) -> Option<&[SealedVideoFrame]> {
+        if self.complete {
+            Some(&self.run)
+        } else {
+            None
+        }
+    }
+}
+
 /// One viewer's lane: its queue plus the task draining it into a
 /// unidirectional stream. Dropping the lane aborts the task and closes
 /// the stream.
@@ -283,6 +377,10 @@ impl VideoSendQueue {
 struct Lane {
     queue: Arc<Mutex<VideoSendQueue>>,
     wake: Arc<Notify>,
+    /// Consecutive open/send failures — reset by any successful send.
+    /// The sharer's watchdog reads this to treat a dead forwarder as
+    /// unreachable and re-elect (v1 reachability signal).
+    failures: Arc<AtomicU32>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -305,6 +403,13 @@ pub struct VideoFanout {
     lanes: Mutex<BTreeMap<IdentityId, Lane>>,
     /// Frames dropped across all lanes (stats).
     dropped_total: AtomicU64,
+    /// Last-keyframe-run cache (relay fan-outs): primes late lanes
+    /// without involving the sharer. `None` on the sharer's own fan-out,
+    /// where forcing the shared encoder is the cheaper primer.
+    cache: Option<Mutex<KeyframeCache>>,
+    /// One-shot external IDR demand (a forwarder's `KeyframeRequest`),
+    /// cleared when the next keyframe goes out.
+    keyframe_demanded: AtomicBool,
 }
 
 impl std::fmt::Debug for VideoFanout {
@@ -319,18 +424,46 @@ impl std::fmt::Debug for VideoFanout {
 /// beyond that the viewer is better served by a fresh keyframe run.
 const LANE_QUEUE_DEPTH: usize = 4;
 
+/// Keyframe-run cache ceiling for relay fan-outs: comfortably one full
+/// intra period of 1280-wide screen content (~15 s at the observed
+/// ~350 kbps worst case), small enough to never matter in RAM.
+pub const RELAY_CACHE_BYTES: usize = 4 * 1024 * 1024;
+
 impl VideoFanout {
     pub fn new(transport: Arc<dyn MediaStreamTransport>, call: CallId) -> Arc<Self> {
+        Self::build(transport, call, None)
+    }
+
+    /// A relay's fan-out: same lanes, plus the keyframe-run cache that
+    /// serves late joiners without touching the sharer.
+    pub fn new_relay(transport: Arc<dyn MediaStreamTransport>, call: CallId) -> Arc<Self> {
+        Self::build(
+            transport,
+            call,
+            Some(Mutex::new(KeyframeCache::new(RELAY_CACHE_BYTES))),
+        )
+    }
+
+    fn build(
+        transport: Arc<dyn MediaStreamTransport>,
+        call: CallId,
+        cache: Option<Mutex<KeyframeCache>>,
+    ) -> Arc<Self> {
         Arc::new(VideoFanout {
             transport,
             call,
             lanes: Mutex::new(BTreeMap::new()),
             dropped_total: AtomicU64::new(0),
+            cache,
+            keyframe_demanded: AtomicBool::new(false),
         })
     }
 
-    /// Follow the roster: new peers get a lane (which starts by demanding
-    /// a keyframe — the late-joiner path), leavers lose theirs.
+    /// Follow the roster: new peers get a lane, leavers lose theirs. On a
+    /// cached (relay) fan-out a fresh lane is primed with the last
+    /// keyframe run — the late joiner sees a picture immediately; without
+    /// a servable cache the lane starts by demanding a keyframe, exactly
+    /// the M16 late-joiner path.
     pub fn set_peers(self: &Arc<Self>, peers: Vec<IdentityId>) {
         let Ok(mut lanes) = self.lanes.lock() else {
             return;
@@ -340,22 +473,51 @@ impl VideoFanout {
             if lanes.contains_key(&peer) {
                 continue;
             }
-            let queue = Arc::new(Mutex::new(VideoSendQueue::new(LANE_QUEUE_DEPTH)));
+            let mut queue = VideoSendQueue::new(LANE_QUEUE_DEPTH);
+            if let Some(cache) = &self.cache {
+                if let Ok(cache) = cache.lock() {
+                    if let Some(run) = cache.run() {
+                        queue.prime(run);
+                    }
+                }
+            }
+            let queue = Arc::new(Mutex::new(queue));
             let wake = Arc::new(Notify::new());
+            let failures = Arc::new(AtomicU32::new(0));
             let task = tokio::spawn(run_lane(
                 Arc::clone(&self.transport),
                 self.call,
                 peer,
                 Arc::clone(&queue),
                 Arc::clone(&wake),
+                Arc::clone(&failures),
             ));
-            lanes.insert(peer, Lane { queue, wake, task });
+            // A primed lane has frames waiting before the task first
+            // parks — wake it so the cached run leaves immediately.
+            wake.notify_one();
+            lanes.insert(
+                peer,
+                Lane {
+                    queue,
+                    wake,
+                    failures,
+                    task,
+                },
+            );
         }
     }
 
     /// Push one sealed frame toward every lane. Never blocks and never
     /// copies the frame — lanes share the sealed bytes.
     pub fn broadcast(&self, frame: &SealedVideoFrame) {
+        if frame.keyframe {
+            self.keyframe_demanded.store(false, Ordering::Relaxed);
+        }
+        if let Some(cache) = &self.cache {
+            if let Ok(mut cache) = cache.lock() {
+                cache.observe(frame);
+            }
+        }
         let Ok(lanes) = self.lanes.lock() else {
             return;
         };
@@ -371,9 +533,13 @@ impl VideoFanout {
     }
 
     /// Does any lane need a keyframe (new viewer, or one recovering from a
-    /// dropped run)? The encode loop consults this every frame and forces
-    /// an IDR — the whole call shares the one encode.
+    /// dropped run), or did a forwarder ask for one? The encode loop
+    /// consults this every frame and forces an IDR — the whole call
+    /// shares the one encode.
     pub fn keyframe_wanted(&self) -> bool {
+        if self.keyframe_demanded.load(Ordering::Relaxed) {
+            return true;
+        }
         let Ok(lanes) = self.lanes.lock() else {
             return false;
         };
@@ -385,6 +551,26 @@ impl VideoFanout {
         })
     }
 
+    /// External IDR demand (a forwarder's relay lane that the cache could
+    /// not prime). One-shot: cleared by the next broadcast keyframe.
+    pub fn demand_keyframe(&self) {
+        self.keyframe_demanded.store(true, Ordering::Relaxed);
+    }
+
+    /// Peers whose lane has failed `threshold`+ consecutive opens/sends —
+    /// the transport-level unreachability signal the sharer's watchdog
+    /// feeds into forwarder re-election.
+    pub fn failing_peers(&self, threshold: u32) -> Vec<IdentityId> {
+        let Ok(lanes) = self.lanes.lock() else {
+            return Vec::new();
+        };
+        lanes
+            .iter()
+            .filter(|(_, lane)| lane.failures.load(Ordering::Relaxed) >= threshold)
+            .map(|(peer, _)| *peer)
+            .collect()
+    }
+
     pub fn peer_count(&self) -> usize {
         self.lanes.lock().map(|lanes| lanes.len()).unwrap_or(0)
     }
@@ -394,16 +580,27 @@ impl VideoFanout {
     }
 }
 
+/// A frame that cannot be written within this bound is a dead peer, not a
+/// slow one: at 10 fps LAN/WAN a sealed frame leaves in milliseconds, but
+/// writing to a silently killed peer *blocks forever* — the transport's
+/// flow-control window fills and the send future never resolves, so
+/// without a deadline the failure counter never moves and re-election
+/// never fires.
+const LANE_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+/// Opening a substream dials if needed; bound it the same way.
+const LANE_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// One lane's drain loop: open the stream (retrying — the peer may still
-/// be dialing), then pop-and-send forever. A send failure closes the
-/// stream, demands a keyframe and reopens: frames are expendable, the
-/// lane is not.
+/// be dialing), then pop-and-send forever. A send failure *or stall*
+/// closes the stream, demands a keyframe and reopens: frames are
+/// expendable, the lane is not.
 async fn run_lane(
     transport: Arc<dyn MediaStreamTransport>,
     call: CallId,
     peer: IdentityId,
     queue: Arc<Mutex<VideoSendQueue>>,
     wake: Arc<Notify>,
+    failures: Arc<AtomicU32>,
 ) {
     let mut stream = None;
     loop {
@@ -411,19 +608,30 @@ async fn run_lane(
         // until there is somewhere to send it, so the opening keyframe
         // survives however long the substream takes to come up.
         if stream.is_none() {
-            match transport
-                .open_stream(peer, call, MediaStreamKind::Video)
-                .await
+            match tokio::time::timeout(
+                LANE_OPEN_TIMEOUT,
+                transport.open_stream(peer, call, MediaStreamKind::Video),
+            )
+            .await
             {
-                Ok(opened) => stream = Some(opened),
-                Err(error) => {
+                Ok(Ok(opened)) => stream = Some(opened),
+                Ok(Err(error)) => {
                     tracing::debug!(%peer, %call, %error, "video lane: stream open failed");
+                    failures.fetch_add(1, Ordering::Relaxed);
                     // Whatever queued while unreachable is stale by the
                     // time the stream exists; restart from a keyframe.
                     if let Ok(mut queue) = queue.lock() {
                         queue.reset_for_keyframe();
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    continue;
+                }
+                Err(_) => {
+                    tracing::debug!(%peer, %call, "video lane: stream open timed out");
+                    failures.fetch_add(1, Ordering::Relaxed);
+                    if let Ok(mut queue) = queue.lock() {
+                        queue.reset_for_keyframe();
+                    }
                     continue;
                 }
             }
@@ -439,11 +647,25 @@ async fn run_lane(
             }
         };
         if let Some(lane_stream) = stream.as_mut() {
-            if let Err(error) = lane_stream.send(&frame.sealed).await {
-                tracing::debug!(%peer, %call, %error, "video lane: send failed, reopening");
-                stream = None;
-                if let Ok(mut queue) = queue.lock() {
-                    queue.reset_for_keyframe();
+            match tokio::time::timeout(LANE_SEND_TIMEOUT, lane_stream.send(&frame.sealed)).await {
+                Ok(Ok(())) => {
+                    failures.store(0, Ordering::Relaxed);
+                }
+                Ok(Err(error)) => {
+                    tracing::debug!(%peer, %call, %error, "video lane: send failed, reopening");
+                    failures.fetch_add(1, Ordering::Relaxed);
+                    stream = None;
+                    if let Ok(mut queue) = queue.lock() {
+                        queue.reset_for_keyframe();
+                    }
+                }
+                Err(_) => {
+                    tracing::debug!(%peer, %call, "video lane: send stalled, reopening");
+                    failures.fetch_add(1, Ordering::Relaxed);
+                    stream = None;
+                    if let Ok(mut queue) = queue.lock() {
+                        queue.reset_for_keyframe();
+                    }
                 }
             }
         }
@@ -459,6 +681,30 @@ pub struct VideoSenderStats {
     pub encoded_bytes: u64,
 }
 
+/// Live knobs of a running video sender. The feedback loop's consumer
+/// side: the engine stores the adapted target here and the encode loop
+/// applies it on the next frame — no restart, no channel round trip.
+#[derive(Debug)]
+pub struct VideoSenderControl {
+    bitrate_bps: AtomicU32,
+}
+
+impl VideoSenderControl {
+    pub fn new(initial_bps: u32) -> Arc<Self> {
+        Arc::new(VideoSenderControl {
+            bitrate_bps: AtomicU32::new(initial_bps),
+        })
+    }
+
+    pub fn set_bitrate(&self, bps: u32) {
+        self.bitrate_bps.store(bps, Ordering::Relaxed);
+    }
+
+    pub fn bitrate(&self) -> u32 {
+        self.bitrate_bps.load(Ordering::Relaxed)
+    }
+}
+
 /// Pump captured frames through gate → encoder → seal → fan-out until the
 /// capture channel closes. Returns totals. The frame is encoded and
 /// sealed exactly once regardless of viewer count.
@@ -467,6 +713,7 @@ pub async fn run_video_sender(
     key: &CallKey,
     ssrc: u32,
     fps_hint: u32,
+    control: Arc<VideoSenderControl>,
     mut frames: mpsc::Receiver<CapturedFrame>,
     mut encoder: Box<dyn VideoEncoder>,
 ) -> VideoSenderStats {
@@ -476,7 +723,18 @@ pub async fn run_video_sender(
     let mut window = VideoSenderStats::default();
     let mut window_start = std::time::Instant::now();
     let ts_step = VIDEO_CLOCK_HZ / fps_hint.max(1);
+    let mut applied_bitrate = control.bitrate();
     while let Some(frame) = frames.recv().await {
+        let wanted_bitrate = control.bitrate();
+        if wanted_bitrate != applied_bitrate {
+            tracing::info!(
+                from_bps = applied_bitrate,
+                to_bps = wanted_bitrate,
+                "video tx: adapting encoder bitrate"
+            );
+            encoder.set_target_bitrate(wanted_bitrate);
+            applied_bitrate = wanted_bitrate;
+        }
         let keyframe_wanted = fanout.keyframe_wanted();
         // Static frames cost nothing — unless a viewer needs a keyframe,
         // which a static screen must not starve.
@@ -526,8 +784,9 @@ pub async fn run_video_sender(
                 bytes_per_s = window.encoded_bytes,
                 keyframes = window.keyframes,
                 skipped_static = window.skipped_static,
-                viewers = fanout.peer_count(),
+                tx_lanes = fanout.peer_count(),
                 dropped_total = fanout.dropped_total(),
+                bitrate_bps = applied_bitrate,
                 "video tx"
             );
             window = VideoSenderStats::default();
@@ -813,6 +1072,114 @@ mod tests {
         assert!(kept.keyframe);
     }
 
+    /// A peer killed silently never errors — its sends just stall on a
+    /// full flow-control window. The lane's deadline must turn that into
+    /// counted failures, or forwarder re-election can never fire.
+    #[tokio::test(start_paused = true)]
+    async fn a_silently_dead_peer_becomes_a_failing_lane() {
+        struct StallingStream;
+
+        #[async_trait]
+        impl MediaSendStream for StallingStream {
+            async fn send(&mut self, _sealed_frame: &[u8]) -> Result<(), TransportError> {
+                std::future::pending().await
+            }
+        }
+
+        struct StallingTransport;
+
+        #[async_trait]
+        impl MediaStreamTransport for StallingTransport {
+            async fn open_stream(
+                &self,
+                _to: IdentityId,
+                _call: CallId,
+                _kind: MediaStreamKind,
+            ) -> Result<Box<dyn MediaSendStream>, TransportError> {
+                Ok(Box::new(StallingStream))
+            }
+        }
+
+        let fanout = VideoFanout::new(Arc::new(StallingTransport), call());
+        fanout.set_peers(vec![identity(2)]);
+        assert!(fanout.failing_peers(3).is_empty());
+        // Keep feeding keyframes the way a live share would (each failed
+        // run demands one); the stalled sends must accumulate failures.
+        for _ in 0..8 {
+            fanout.broadcast(&sealed_frame(1, true));
+            tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        }
+        assert_eq!(
+            fanout.failing_peers(3),
+            vec![identity(2)],
+            "a stalled lane must count as unreachable"
+        );
+    }
+
+    #[test]
+    fn priming_seeds_a_run_that_survives_the_next_broadcast() {
+        let mut queue = VideoSendQueue::new(2);
+        let run: Vec<SealedVideoFrame> = vec![
+            sealed_frame(0, true),
+            sealed_frame(1, false),
+            sealed_frame(2, false),
+            sealed_frame(3, false),
+        ];
+        queue.prime(&run);
+        assert!(!queue.awaiting_keyframe());
+        assert_eq!(queue.len(), 4);
+        // A live frame lands on top of the primed backlog without nuking
+        // it, even though 4 > capacity 2 — the allowance covers the run.
+        assert_eq!(queue.push(sealed_frame(4, false)), PushOutcome::Queued);
+        let drained: Vec<u8> = std::iter::from_fn(|| queue.pop().map(|f| f.sealed[0])).collect();
+        assert_eq!(drained, vec![0, 1, 2, 3, 4]);
+        // Fully drained, the allowance is spent: steady-state capacity
+        // rules again (keyframe, delta, then overflow on the third).
+        queue.push(sealed_frame(5, true));
+        queue.push(sealed_frame(6, false));
+        assert!(matches!(
+            queue.push(sealed_frame(7, false)),
+            PushOutcome::DroppedRun { .. }
+        ));
+    }
+
+    #[test]
+    fn priming_refuses_runs_that_do_not_open_with_a_keyframe() {
+        let mut queue = VideoSendQueue::new(2);
+        queue.prime(&[sealed_frame(1, false)]);
+        assert!(queue.is_empty());
+        assert!(queue.awaiting_keyframe());
+        queue.prime(&[]);
+        assert!(queue.awaiting_keyframe());
+    }
+
+    #[test]
+    fn keyframe_cache_keeps_whole_runs_and_discards_overflow() {
+        let mut cache = KeyframeCache::new(20);
+        // Deltas before any keyframe: nothing to serve.
+        cache.observe(&sealed_frame(1, false));
+        assert!(cache.run().is_none());
+        // A run forms.
+        cache.observe(&sealed_frame(2, true));
+        cache.observe(&sealed_frame(3, false));
+        let run = cache.run().unwrap();
+        assert_eq!(run.len(), 2);
+        assert!(run[0].keyframe);
+        // A new keyframe restarts the run.
+        cache.observe(&sealed_frame(4, true));
+        assert_eq!(cache.run().unwrap().len(), 1);
+        // Overflow discards the whole run — a partial run is garbage.
+        let big = SealedVideoFrame {
+            sealed: Arc::new(vec![9; 64]),
+            keyframe: false,
+        };
+        cache.observe(&big);
+        assert!(cache.run().is_none());
+        // The next keyframe starts serving again.
+        cache.observe(&sealed_frame(5, true));
+        assert_eq!(cache.run().unwrap().len(), 1);
+    }
+
     #[test]
     fn static_gate_passes_changes_and_skips_repeats() {
         let mut gate = StaticFrameGate::default();
@@ -842,6 +1209,7 @@ mod tests {
             &key,
             77,
             10,
+            VideoSenderControl::new(1_500_000),
             frame_rx,
             Box::new(FakeEncoder {
                 force_all_key: false,
@@ -899,6 +1267,7 @@ mod tests {
                     &key,
                     77,
                     10,
+                    VideoSenderControl::new(1_500_000),
                     frame_rx,
                     Box::new(FakeEncoder {
                         force_all_key: false,

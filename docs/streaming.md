@@ -9,13 +9,13 @@ frame exactly once, regardless of how many people watch.**
 
 ## The five architecture points, and where each one stands
 
-| # | Point | Status after M16 |
-|---|-------|------------------|
-| 1 | Peer-elected forwarding tree (a *peer role*, not an SFU server) | **Deferred** — seam left (see below) |
+| # | Point | Status |
+|---|-------|--------|
+| 1 | Peer-elected forwarding tree (a *peer role*, not an SFU server) | **Done with caveats** (M17) — depth-2 tree, one forwarder, deterministic v1 election; see below |
 | 2 | Unidirectional stream transport, no per-frame acks, per-peer latest-wins queues | **Done** for video |
 | 3 | Weak-machine encoding: screen-content codec, 5–15 fps, static-frame awareness | **Done pragmatically** (software OpenH264; temporal layers deferred) |
-| 4 | Viewer→sharer feedback loop + forwarder keyframe cache | **Partially done** — implicit keyframe demand only; explicit feedback deferred |
-| 5 | NAT traversal (relay / dcutr / autonat) | **Done** (M18) — see below |
+| 4 | Viewer→sharer feedback loop + forwarder keyframe cache | **Done with caveats** (M17) — coarse 2 s reports, loss-based bitrate steps, keyframe-run cache on forwarders |
+| 5 | NAT traversal (relay / dcutr / autonat) | **Done** (M18, a parallel milestone) — see below |
 
 ## What M16 implements
 
@@ -89,30 +89,109 @@ frame exactly once, regardless of how many people watch.**
 A new viewer's lane starts in "awaiting keyframe" state; the encode loop
 sees the demand and forces a single IDR that every lane shares. The same
 mechanism recovers a lane after a dropped run or a stream reopen. This is
-the *implicit* feedback loop; the explicit one is deferred (below).
+the *implicit* feedback loop; M17 adds the explicit one (below) and moves
+the late-join burden onto the forwarder's keyframe cache.
+
+## What M17 implements (points 1 + 4)
+
+### The forwarding tree (point 1): a peer role, never a server
+
+- **Domain.** The `Call` aggregate owns forwarding: per-sharer elected
+  forwarder entries that *cannot* be invalid — a forwarder that isn't
+  seated, a sharer forwarding their own stream, or a forwarder for a
+  non-share are all unrepresentable (`elect_forwarder` refuses them, and
+  `leave`/`set_screen_sharing(false)` clear entries the moment either
+  party departs or the share stops, emitting `ForwarderCleared`).
+  Election *policy* is a domain-service seam (`ForwarderStrategy`): v1 is
+  `LowestSeatedIdentity` — **the lowest identity among seated non-sharer
+  peers**, deterministic and re-derivable from roster state alone, and
+  only when ≥ 2 candidates exist (with one viewer, a forwarder is pure
+  overhead — direct fan-out costs the sharer the same single uplink).
+  Real scoring (uplink bandwidth, CPU headroom, public reachability — the
+  M18 autonat verdicts are the natural input) replaces the implementation
+  behind the same trait. An elected forwarder *keeps* the role while it
+  stays seated and reachable: stability beats optimality, nobody swaps a
+  working forwarder because a lower identity joined.
+- **Election runs on the sharer's node** (`CallService::
+  reconcile_forwarder`), whose roster view is authoritative for its own
+  share; it re-runs on every call event and on a 1 s watchdog. Transport
+  failures feed it: a forwarder whose lane fails ~3 consecutive
+  opens/sends counts as unreachable and is re-elected away — the v1
+  stand-in for reachability scoring.
+- **Signaling rides in-band** on the existing media streams as sealed
+  `MediaKind::Control` frames under the call key (`ControlMessage`:
+  assign / revoke / ack / feedback / keyframe-request) — exactly as
+  authenticated as the media itself, zero new wire protocols. The
+  `CallAction`-envelope form the spec sketched needs a wire-DTO addition
+  in `mikall-net`, which was frozen under the parallel NAT milestone;
+  moving these five messages onto signed envelopes later is a mechanical
+  transport swap behind `CallService`.
+- **Sharer side:** when a forwarder is in force, `VideoFanout::set_peers`
+  targets *only the forwarder* — capture, encode, and seal never learn
+  the difference, and the per-second `video tx` log's `tx_lanes` shows 1
+  regardless of viewer count. No eligible forwarder (2-party call, or the
+  forwarder just died) → `set_peers(all viewers)`, byte-for-byte the M16
+  behavior. A dying forwarder never ends a share: re-election plus
+  retarget costs at worst a brief stall, and fresh lanes recover through
+  the existing awaiting-keyframe machinery.
+- **Forwarder side:** the per-call *video pump* (`mikall-media::relay`)
+  owns the inbound tap and, while assigned, repeats the sharer's sealed
+  frames verbatim into its own relay `VideoFanout` toward the viewer set.
+  **The relay path never decrypts**: it reads only the plaintext
+  authenticated header (`peek_header`) — the keyframe flag travels as
+  AAD precisely so a relay can trust it without the key. The tests pin
+  this down by relaying frames sealed under a key the pump does not hold.
+  The forwarder also remains a full viewer (it decodes its own copy), and
+  viewers attribute relayed frames to the *sharer* by ssrc, rendering
+  "via <forwarder>" in the viewer pane.
+- **Keyframe cache (the forwarder half of point 4).** Beside the relay
+  fan-out's lane queues sits a `KeyframeCache` holding the last complete
+  keyframe *run* (keyframe + every delta since — H.264 deltas chain, so
+  anything less would decode to garbage; byte-capped at 4 MiB, an
+  overgrown run is discarded whole). A late-joining viewer's fresh lane
+  is primed from the cache and sees a picture immediately — the sharer
+  re-encodes nothing. Only when the cache cannot serve does the forwarder
+  send a `KeyframeRequest` and the sharer force one IDR.
+
+### The feedback loop (point 4): viewers report, the sharer adapts
+
+- **Reports go direct to the sharer**, not aggregated by the forwarder:
+  at the 8-seat mesh cap that is ≤ 7 tiny sealed messages every 2 s; it
+  works identically with no forwarder (2-party fallback) and survives the
+  forwarder dying mid-share. Forwarder aggregation earns its complexity
+  only with subscribe-only audiences (below).
+- **What a viewer measures:** per 2 s window, `received` = sealed video
+  frames that arrived, `lost` = header-counter gaps (streams are ordered
+  and reliable per hop, so a gap is a run dropped at some sender lane —
+  the congestion signal). Measured on plaintext headers, no decode
+  dependency; empty windows are silence and report nothing.
+- **The control law** (`BitrateController`, deliberately simple and
+  stable — worst viewer governs):
+  - any report with **≥ 5 % loss** steps the encoder target down to
+    **70 %**, at most once per **4 s** cooldown, floor **200 kbps**;
+  - the target steps up to **125 %** only after **10 s** in which *every*
+    report was ≤ 1 % loss (any bad window resets the clock), same 10 s
+    cooldown, ceiling **1.5 Mbps** (the encoder default);
+  - actuator: the OpenH264 encoder is rebuilt at the new bitrate on the
+    next frame (the crate has no safe runtime setter); the rebuild's
+    opening IDR doubles as the resync every lane accepts.
 
 ## What is deferred, and the seams left for it
 
-- **Forwarding tree (point 1).** The fan-out is isolated behind exactly
-  one interface: `VideoFanout` in `mikall-media` — the sharer's pipeline
-  calls `broadcast` once per frame and never knows who is on the other
-  end. Electing 1–2 forwarders means calling `VideoFanout::set_peers`
-  with the forwarders instead of all viewers; capture, encode, and seal
-  are untouched. Sealed bytes are relayable as-is: forwarders never need
-  the call key to relay (AEAD is end-to-end), and the keyframe flag they
-  need for caching is in the *authenticated plaintext header*. The
-  domain-model work (publisher/subscriber roster roles, election scoring,
-  raising the viewer cap past the 8-voice mesh invariant) is that
-  milestone's core.
-- **Keyframe cache.** Today the sharer re-encodes an IDR per join (cheap
-  at 10 fps, wrong at scale). The cache belongs beside the lane queues in
-  `VideoFanout` — on forwarders once they exist — holding the last sealed
-  keyframe for instant late-join pictures without touching the sharer.
-- **Explicit feedback (point 4).** Viewers do not yet report
-  received-rate/loss, and the encoder does not adapt bitrate. The
-  signaling idiom for it exists (`CallAction`, the `Mute` pattern); it was
-  deliberately not added until there is an adaptation policy to serve.
-- **NAT traversal (point 5) — done in M18.** The swarm now composes the
+- **Viewers are still full call participants.** The forwarding tree
+  changes who *carries* the pixels, not who may watch: every viewer holds
+  a seat, so the mesh cap of 8 still bounds a share's audience. The next
+  architectural step on this axis is the **subscribe-only audience** —
+  watchers who hold the call key and a stream lane but no roster seat (no
+  voice mesh cost, no cap pressure); that is the milestone where the
+  domain grows a publisher/subscriber split beside the seated roster,
+  forwarder *scoring* starts to matter (aggregate audience uplink), the
+  tree may need depth > 2 and more than one forwarder, and
+  forwarder-side feedback aggregation earns its place.
+- **Temporal layering** (droppable every-other-frame) still waits; with
+  the tree in place, forwarders are now positioned to exploit it by
+  thinning streams per slow viewer instead of dropping whole runs.
+- **NAT traversal (point 5) — done in M18, a parallel milestone.** The swarm now composes the
   stock rust-libp2p behaviours: autonat v1 (every node probes its own
   reachability *and* serves probes for others), the circuit-relay v2
   service (every mikall node donates modest, capped relay capacity by
@@ -131,12 +210,22 @@ the *implicit* feedback loop; the explicit one is deferred (below).
 ## Honest v1 constraints
 
 - Software H.264, one spatial/temporal layer, 10 fps, ≤1280 wide.
-- Single-hop fan-out: the sharer still uplinks once *per viewer* (sealed
-  once, sent N−1 times). Fine to the 8-seat voice cap; the forwarding
-  tree is what changes the scaling law beyond it.
+- With ≥ 2 other seats the sharer uplinks each frame **once, to the
+  forwarder** — sharer cost is constant in viewer count; the forwarder
+  pays the N−1 fan-out (it was elected as the peer that can). In a
+  2-party call the sharer sends directly, which is the same single
+  uplink.
+- The audience is still capped at the 8-seat mesh (viewers are seated
+  participants); subscribe-only watchers beyond the cap are the next
+  step, above.
 - Frames go to every call peer whether or not they opened the viewer
   pane (viewers decode only what they watch; suppressing unwatched sends
-  is part of the subscriber-role work in point 1).
+  is part of the same subscriber-role work).
+- Election trusts the transport's failure counters for liveness; a
+  forwarder that is up but *selectively* not forwarding is undetected
+  until viewers' loss reports say so (and even then v1 only adapts
+  bitrate). Malicious-forwarder handling rides on feedback-driven
+  re-election, later.
 - A fully static screen can delay capture-thread shutdown until the next
   screen change (ScreenCaptureKit only wakes the thread on frames); in
   practice stopping a share repaints the screen and releases it
