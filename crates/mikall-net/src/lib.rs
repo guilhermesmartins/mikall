@@ -5,6 +5,13 @@
 //! The libp2p transport keypair is derived from the *same* Ed25519 secret
 //! as the mikall identity, so a peer's `PeerId` is a pure function of its
 //! `IdentityId`: DMs route without any lookup table.
+//!
+//! NAT traversal is peer-run, no servers: every node probes its own
+//! reachability (autonat v1), every node offers modest circuit-relay
+//! capacity ([`RelayLimits`]), a NATed node automatically reserves a
+//! circuit slot on a connected public peer and publishes the resulting
+//! `/p2p-circuit` listen address, and DCUtR upgrades relayed connections
+//! to direct ones by hole punching.
 
 pub mod wire;
 
@@ -14,12 +21,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use libp2p::core::transport::ListenerId;
 use libp2p::kad::store::RecordStore as _;
+use libp2p::multiaddr::Protocol;
 use libp2p::swarm::behaviour::toggle::Toggle;
-use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
+use libp2p::swarm::{ConnectionId, NetworkBehaviour, SwarmEvent};
 use libp2p::{
-    gossipsub, identify, identity, kad, mdns, noise, request_response, tcp, yamux, Multiaddr,
-    PeerId, StreamProtocol, Swarm,
+    autonat, dcutr, gossipsub, identify, identity, kad, mdns, noise, relay, request_response, tcp,
+    yamux, Multiaddr, PeerId, StreamProtocol, Swarm,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
@@ -145,6 +154,20 @@ struct Behaviour {
     /// outside the swarm command loop, so media can never head-of-line
     /// block signaling — and vice versa.
     media_stream: libp2p_stream::Behaviour,
+    /// Reachability probing (autonat v1): every node is client *and*
+    /// server, so any two connected mikall peers can tell each other
+    /// whether they are publicly dialable.
+    autonat: autonat::Behaviour,
+    /// The peer-run relay: circuit-relay v2 *service*, on by default with
+    /// the conservative [`RelayLimits`], togglable via
+    /// [`NetConfig::relay_service`].
+    relay: Toggle<relay::Behaviour>,
+    /// Circuit-relay v2 client — lets a NATed node hold a reservation and
+    /// accept inbound connections through `/p2p-circuit` addresses.
+    relay_client: relay::client::Behaviour,
+    /// Direct Connection Upgrade through Relay: hole punch a relayed
+    /// connection into a direct one whenever possible.
+    dcutr: dcutr::Behaviour,
 }
 
 /// The unidirectional media-stream protocol: a 17-byte stream header
@@ -159,6 +182,17 @@ const MAX_MEDIA_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub struct NetConfig {
     pub listen: Vec<Multiaddr>,
     pub enable_mdns: bool,
+    /// Serve as a circuit-relay hop for other peers. This is the peer-run
+    /// relay model: every publicly reachable mikall node donates modest,
+    /// capped forwarding capacity, so NATed peers always have somewhere to
+    /// reserve a slot without anyone running a server.
+    pub relay_service: bool,
+    /// Caps on the donated relay capacity.
+    pub relay_limits: RelayLimits,
+    /// How the node decides whether it needs a relay reservation.
+    pub reachability: ReachabilityMode,
+    /// Reachability-probe cadence and scope (autonat v1).
+    pub probe: ProbeConfig,
 }
 
 impl Default for NetConfig {
@@ -173,8 +207,101 @@ impl Default for NetConfig {
                     .unwrap_or_else(|_| Multiaddr::empty()),
             ],
             enable_mdns: true,
+            relay_service: true,
+            relay_limits: RelayLimits::default(),
+            reachability: ReachabilityMode::default(),
+            probe: ProbeConfig::default(),
         }
     }
+}
+
+/// Caps on the relay capacity a node donates ([`NetConfig::relay_service`]).
+///
+/// The defaults are deliberately modest — a relayed circuit exists to carry
+/// signaling and to bridge the gap until DCUtR upgrades the path to a
+/// direct connection, not to carry media for hours on someone else's
+/// uplink: 8 reservations, 8 circuits (2 per peer), 10 minutes and 8 MiB
+/// per direction per circuit. 8 full circuits at the cap bound the total
+/// donation at 64 MiB each way per circuit lifetime; sustained media over
+/// a relay hits the cap in minutes by design.
+#[derive(Debug, Clone)]
+pub struct RelayLimits {
+    /// Concurrent reservations held by NATed peers.
+    pub max_reservations: usize,
+    /// Concurrent relayed circuits.
+    pub max_circuits: usize,
+    /// Concurrent circuits per source peer.
+    pub max_circuits_per_peer: usize,
+    /// Lifetime cap per circuit.
+    pub max_circuit_duration: Duration,
+    /// Byte cap per circuit direction.
+    pub max_circuit_bytes: u64,
+}
+
+impl Default for RelayLimits {
+    fn default() -> Self {
+        RelayLimits {
+            max_reservations: 8,
+            max_circuits: 8,
+            max_circuits_per_peer: 2,
+            max_circuit_duration: Duration::from_secs(10 * 60),
+            max_circuit_bytes: 8 * 1024 * 1024,
+        }
+    }
+}
+
+/// How the node decides whether to hold a relay reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReachabilityMode {
+    /// Trust the autonat probe verdict (default): reserve while Private,
+    /// drop the reservation when Public.
+    #[default]
+    Probe,
+    /// Behave as publicly reachable: never reserve a relay slot.
+    AssumePublic,
+    /// Behave as NATed: always hold a relay reservation when a
+    /// relay-capable peer is connected. Used by tests (loopback defeats
+    /// honest probing) and by users whose NAT defeats the probes.
+    AssumePrivate,
+}
+
+/// autonat v1 probe cadence. Defaults mirror libp2p's production values;
+/// integration tests shorten them and allow non-global addresses so
+/// loopback swarms can probe each other.
+#[derive(Debug, Clone)]
+pub struct ProbeConfig {
+    /// Delay before the first probe after boot.
+    pub boot_delay: Duration,
+    /// Retry interval while the verdict is still unknown / low-confidence.
+    pub retry_interval: Duration,
+    /// Re-probe interval once a confident verdict exists.
+    pub refresh_interval: Duration,
+    /// Refuse to involve non-global IP addresses in probes (both as
+    /// server and when picking servers). True in production; loopback
+    /// tests set false.
+    pub only_global_ips: bool,
+}
+
+impl Default for ProbeConfig {
+    fn default() -> Self {
+        ProbeConfig {
+            boot_delay: Duration::from_secs(15),
+            retry_interval: Duration::from_secs(90),
+            refresh_interval: Duration::from_secs(15 * 60),
+            only_global_ips: true,
+        }
+    }
+}
+
+/// The probed NAT verdict, surfaced through [`NetControl::reachability`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reachability {
+    /// No confident probe result yet.
+    Unknown,
+    /// At least one autonat server dialed us back successfully.
+    Public,
+    /// Probes failed or were refused — assume NATed.
+    Private,
 }
 
 type DmReply = oneshot::Sender<Result<(), TransportError>>;
@@ -206,6 +333,8 @@ enum Command {
     ListenAddrs(oneshot::Sender<Vec<Multiaddr>>),
     Dial(Multiaddr, oneshot::Sender<Result<(), TransportError>>),
     ConnectedPeers(oneshot::Sender<Vec<PeerId>>),
+    Reachability(oneshot::Sender<Reachability>),
+    PeerConnections(PeerId, oneshot::Sender<Vec<Multiaddr>>),
     MeshPeerCount(ChannelId, oneshot::Sender<usize>),
     SendOffer(
         IdentityId,
@@ -271,6 +400,33 @@ impl NetControl {
     pub async fn connected_peers(&self) -> Vec<PeerId> {
         let (tx, rx) = oneshot::channel();
         if self.tx.send(Command::ConnectedPeers(tx)).await.is_err() {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
+    }
+
+    /// The probed NAT verdict (autonat v1). `Unknown` until the first
+    /// confident probe; on a LAN with no probe servers it stays `Unknown`
+    /// forever, which is honest.
+    pub async fn reachability(&self) -> Reachability {
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(Command::Reachability(tx)).await.is_err() {
+            return Reachability::Unknown;
+        }
+        rx.await.unwrap_or(Reachability::Unknown)
+    }
+
+    /// Remote addresses of the live connections to `peer` — lets callers
+    /// distinguish a relayed path (contains `/p2p-circuit`) from a direct
+    /// one, e.g. to observe a DCUtR upgrade.
+    pub async fn peer_connections(&self, peer: PeerId) -> Vec<Multiaddr> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(Command::PeerConnections(peer, tx))
+            .await
+            .is_err()
+        {
             return Vec::new();
         }
         rx.await.unwrap_or_default()
@@ -630,6 +786,18 @@ struct NetDriver {
     swarm: Swarm<Behaviour>,
     cmd_rx: mpsc::Receiver<Command>,
     keys: Arc<LocalKeys>,
+    /// Policy for the relay-reservation lifecycle.
+    reachability_mode: ReachabilityMode,
+    /// Latest autonat verdict.
+    nat_status: Reachability,
+    /// Connected peers that advertise the circuit-relay hop protocol via
+    /// identify, with their non-circuit listen addresses — the pool a
+    /// NATed node reserves from.
+    relay_candidates: HashMap<PeerId, Vec<Multiaddr>>,
+    /// The active (or in-flight) circuit listener and the relay serving it.
+    relay_listener: Option<(ListenerId, PeerId)>,
+    /// Remote address of every live connection, for [`Command::PeerConnections`].
+    conn_addrs: HashMap<PeerId, HashMap<ConnectionId, Multiaddr>>,
 }
 
 impl NetStack {
@@ -639,7 +807,14 @@ impl NetStack {
         let secret = keys.secret_bytes();
         let keypair = identity::Keypair::ed25519_from_bytes(*secret)
             .map_err(|e| NetError::Build(e.to_string()))?;
-        let enable_mdns = config.enable_mdns;
+        let NetConfig {
+            listen,
+            enable_mdns,
+            relay_service,
+            relay_limits,
+            reachability,
+            probe,
+        } = config;
 
         let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
@@ -650,7 +825,9 @@ impl NetStack {
             )
             .map_err(|e| NetError::Build(e.to_string()))?
             .with_quic()
-            .with_behaviour(|key| {
+            .with_relay_client(noise::Config::new, yamux::Config::default)
+            .map_err(|e| NetError::Build(e.to_string()))?
+            .with_behaviour(|key, relay_client| {
                 let peer_id = PeerId::from(key.public());
                 let gossipsub_config = gossipsub::ConfigBuilder::default()
                     .validation_mode(gossipsub::ValidationMode::Strict)
@@ -711,6 +888,31 @@ impl NetStack {
                     request_response::Config::default(),
                 );
 
+                let autonat = autonat::Behaviour::new(
+                    peer_id,
+                    autonat::Config {
+                        boot_delay: probe.boot_delay,
+                        retry_interval: probe.retry_interval,
+                        refresh_interval: probe.refresh_interval,
+                        only_global_ips: probe.only_global_ips,
+                        ..autonat::Config::default()
+                    },
+                );
+
+                let relay_server = relay_service.then(|| {
+                    relay::Behaviour::new(
+                        peer_id,
+                        relay::Config {
+                            max_reservations: relay_limits.max_reservations,
+                            max_circuits: relay_limits.max_circuits,
+                            max_circuits_per_peer: relay_limits.max_circuits_per_peer,
+                            max_circuit_duration: relay_limits.max_circuit_duration,
+                            max_circuit_bytes: relay_limits.max_circuit_bytes,
+                            ..relay::Config::default()
+                        },
+                    )
+                });
+
                 Ok(Behaviour {
                     gossipsub,
                     kad,
@@ -720,13 +922,17 @@ impl NetStack {
                     blob,
                     media,
                     media_stream: libp2p_stream::Behaviour::new(),
+                    autonat,
+                    relay: Toggle::from(relay_server),
+                    relay_client,
+                    dcutr: dcutr::Behaviour::new(peer_id),
                 })
             })
             .map_err(|e| NetError::Build(e.to_string()))?
             .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
             .build();
 
-        for addr in &config.listen {
+        for addr in &listen {
             if !addr.is_empty() {
                 let _ = swarm.listen_on(addr.clone());
             }
@@ -761,6 +967,11 @@ impl NetStack {
                 swarm,
                 cmd_rx,
                 keys,
+                reachability_mode: reachability,
+                nat_status: Reachability::Unknown,
+                relay_candidates: HashMap::new(),
+                relay_listener: None,
+                conn_addrs: HashMap::new(),
             },
             incoming_media_streams,
         })
@@ -794,6 +1005,12 @@ impl NetDriver {
         let mut blob_pending: BlobPending = HashMap::new();
         let mut kad_lookups: KadLookups = HashMap::new();
 
+        // Relay-lifecycle maintenance: a cheap periodic sweep retries
+        // failed or missing reservations without any bespoke retry
+        // plumbing on individual failure paths.
+        let mut relay_tick = tokio::time::interval(Duration::from_secs(3));
+        relay_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
                 command = self.cmd_rx.recv() => {
@@ -803,6 +1020,58 @@ impl NetDriver {
                 event = self.swarm.select_next_some() => {
                     self.handle_event(event, &topics, &mut dm_pending, &mut blob_pending, &mut kad_lookups, &handler, &blobs).await;
                 }
+                _ = relay_tick.tick() => {
+                    self.ensure_relay_reservation();
+                }
+            }
+        }
+    }
+
+    /// Converge the relay-reservation state on the current reachability
+    /// verdict: a (probed or assumed) private node holds exactly one
+    /// reservation on a connected relay-capable peer, a public node holds
+    /// none. Idempotent; called on verdict changes, on new relay
+    /// candidates, and from the periodic sweep (which is what retries
+    /// after a failed or lost reservation).
+    fn ensure_relay_reservation(&mut self) {
+        let wants_relay = match self.reachability_mode {
+            ReachabilityMode::AssumePrivate => true,
+            ReachabilityMode::AssumePublic => false,
+            ReachabilityMode::Probe => self.nat_status == Reachability::Private,
+        };
+        if !wants_relay {
+            if let Some((listener, relay_peer)) = self.relay_listener.take() {
+                tracing::info!(relay = %relay_peer, "publicly reachable — dropping relay reservation");
+                let _ = self.swarm.remove_listener(listener);
+            }
+            return;
+        }
+        if self.relay_listener.is_some() {
+            return;
+        }
+        let local = *self.swarm.local_peer_id();
+        let candidate = self.relay_candidates.iter().find_map(|(peer, addrs)| {
+            if *peer == local || !self.swarm.is_connected(peer) {
+                return None;
+            }
+            // Never chain relays: reserve over a direct address only.
+            let addr = addrs
+                .iter()
+                .find(|a| !a.iter().any(|p| matches!(p, Protocol::P2pCircuit)))?;
+            let with_peer = addr.clone().with_p2p(*peer).ok()?;
+            Some((*peer, with_peer.with(Protocol::P2pCircuit)))
+        });
+        let Some((relay_peer, circuit_addr)) = candidate else {
+            tracing::debug!("private but no connected relay-capable peer yet");
+            return;
+        };
+        match self.swarm.listen_on(circuit_addr.clone()) {
+            Ok(listener) => {
+                tracing::info!(relay = %relay_peer, addr = %circuit_addr, "requesting relay reservation");
+                self.relay_listener = Some((listener, relay_peer));
+            }
+            Err(error) => {
+                tracing::debug!(addr = %circuit_addr, %error, "relay reservation listen failed");
             }
         }
     }
@@ -910,6 +1179,17 @@ impl NetDriver {
             Command::ConnectedPeers(reply) => {
                 let peers: Vec<PeerId> = self.swarm.connected_peers().copied().collect();
                 let _ = reply.send(peers);
+            }
+            Command::Reachability(reply) => {
+                let _ = reply.send(self.nat_status);
+            }
+            Command::PeerConnections(peer, reply) => {
+                let addrs: Vec<Multiaddr> = self
+                    .conn_addrs
+                    .get(&peer)
+                    .map(|conns| conns.values().cloned().collect())
+                    .unwrap_or_default();
+                let _ = reply.send(addrs);
             }
             Command::MeshPeerCount(channel, reply) => {
                 let topic = topic_of(&channel);
@@ -1114,8 +1394,17 @@ impl NetDriver {
                 info,
                 ..
             })) => {
-                for addr in info.listen_addrs {
-                    self.swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                for addr in &info.listen_addrs {
+                    self.swarm
+                        .behaviour_mut()
+                        .kad
+                        .add_address(&peer_id, addr.clone());
+                }
+                // A peer advertising the circuit-relay hop protocol is a
+                // reservation candidate for us if we turn out to be NATed.
+                if info.protocols.contains(&relay::HOP_PROTOCOL_NAME) {
+                    self.relay_candidates.insert(peer_id, info.listen_addrs);
+                    self.ensure_relay_reservation();
                 }
             }
             SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {
@@ -1142,6 +1431,98 @@ impl NetDriver {
                 }
                 _ => {}
             },
+            SwarmEvent::Behaviour(BehaviourEvent::Autonat(autonat::Event::StatusChanged {
+                old,
+                new,
+            })) => {
+                tracing::info!(?old, ?new, "reachability verdict changed");
+                self.nat_status = match new {
+                    autonat::NatStatus::Public(_) => Reachability::Public,
+                    autonat::NatStatus::Private => Reachability::Private,
+                    autonat::NatStatus::Unknown => Reachability::Unknown,
+                };
+                self.ensure_relay_reservation();
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Autonat(autonat::Event::OutboundProbe(
+                probe,
+            ))) => {
+                tracing::debug!(?probe, "autonat outbound probe");
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Autonat(autonat::Event::InboundProbe(probe))) => {
+                tracing::debug!(?probe, "autonat inbound probe (serving a peer)");
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::RelayClient(
+                relay::client::Event::ReservationReqAccepted {
+                    relay_peer_id,
+                    renewal,
+                    ..
+                },
+            )) => {
+                if renewal {
+                    tracing::debug!(relay = %relay_peer_id, "relay reservation renewed");
+                } else {
+                    tracing::info!(relay = %relay_peer_id, "relay reservation accepted — reachable via /p2p-circuit");
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::RelayClient(event)) => {
+                tracing::debug!(?event, "relay client event");
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Relay(event)) => {
+                tracing::debug!(?event, "relay service event");
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Dcutr(dcutr::Event {
+                remote_peer_id,
+                result,
+            })) => match result {
+                Ok(_) => {
+                    tracing::info!(peer = %remote_peer_id, "hole punch succeeded — relayed connection upgraded to direct");
+                }
+                Err(error) => {
+                    tracing::info!(peer = %remote_peer_id, %error, "hole punch failed — staying on the relayed path");
+                }
+            },
+            SwarmEvent::ConnectionEstablished {
+                peer_id,
+                connection_id,
+                endpoint,
+                ..
+            } => {
+                self.conn_addrs
+                    .entry(peer_id)
+                    .or_default()
+                    .insert(connection_id, endpoint.get_remote_address().clone());
+            }
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                connection_id,
+                num_established,
+                ..
+            } => {
+                if let Some(conns) = self.conn_addrs.get_mut(&peer_id) {
+                    conns.remove(&connection_id);
+                    if conns.is_empty() {
+                        self.conn_addrs.remove(&peer_id);
+                    }
+                }
+                if num_established == 0 {
+                    self.relay_candidates.remove(&peer_id);
+                }
+            }
+            SwarmEvent::ListenerClosed { listener_id, .. } => {
+                if self.relay_listener.is_some_and(|(id, _)| id == listener_id) {
+                    tracing::info!("relay reservation lost; will retry");
+                    self.relay_listener = None;
+                }
+            }
+            SwarmEvent::ListenerError { listener_id, error } => {
+                if self.relay_listener.is_some_and(|(id, _)| id == listener_id) {
+                    tracing::info!(%error, "relay reservation failed; will retry");
+                    self.relay_listener = None;
+                }
+            }
+            SwarmEvent::ExternalAddrConfirmed { address } => {
+                tracing::info!(%address, "external address confirmed by a probe");
+            }
             SwarmEvent::NewListenAddr { address, .. } => {
                 tracing::info!("listening on {address}");
             }

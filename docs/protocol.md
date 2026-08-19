@@ -55,8 +55,40 @@ on a serverless network and mikall does not pretend otherwise.
   first founder wins a name (squatting is acknowledged in security.md).
 - Identity: signed `IdentityRecord { peer_id, addrs, x25519_prekeys, sig }`
   under `BLAKE3("mikall:id:" + pubkey)`, republished every 12 h, TTL 24 h.
-- Relays: AutoNAT-confirmed public nodes provide under `mikall:relay:v1`;
-  NATed peers reserve circuit slots, then upgrade via DCUtR hole punching.
+- Relays: discovered from *connected* peers, not the DHT — every mikall
+  node advertising the circuit-relay hop protocol via identify is a
+  candidate (a `mikall:relay:v1` provider record for finding relays
+  beyond the connected set remains future work). See "NAT traversal"
+  below.
+
+## NAT traversal (how NATed peers connect)
+
+No servers: every traversal capability is a peer role, composed into
+every node's swarm (M18, stock rust-libp2p behaviours).
+
+- **Reachability** — autonat v1. Every node is probe client *and* probe
+  server: connected peers dial each other back to establish a
+  Public/Private verdict. Identify supplies the observed-address
+  candidates the probes confirm.
+- **Peer-run relays** — circuit-relay v2. Every node offers relay
+  service by default (`NetConfig::relay_service`), capped conservatively
+  (`RelayLimits`): 8 reservations, 8 circuits (2 per source peer),
+  10 minutes and 8 MiB per direction per circuit. The caps are the honesty: a circuit
+  exists to carry signaling and to bridge until hole punching lands —
+  sustained media over someone else's uplink hits the byte cap in
+  minutes *by design*.
+- **Reserving** — a node whose verdict is Private automatically obtains
+  a reservation from a connected relay-capable peer and from then on
+  publishes a `/…/p2p/RELAY/p2p-circuit/p2p/SELF` address among its
+  listen addresses — the same list the settings → network pane and
+  `mikalld /addr` already show, so a NATed node hands out a
+  dialable-from-anywhere address with zero extra UI. Lost reservations
+  are re-acquired automatically; a Public verdict drops them.
+- **Upgrading** — DCUtR. Once a relayed connection exists, both ends
+  hole punch toward a direct connection and traffic migrates off the
+  relay; if the punch fails (symmetric NATs do exist), the relayed
+  connection persists within the caps above, so calls and media over a
+  never-upgraded path degrade honestly rather than silently.
 
 ## End-to-end encryption (staged)
 

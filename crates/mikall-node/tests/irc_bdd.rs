@@ -33,6 +33,7 @@ fn node_config(dir: PathBuf) -> NodeConfig {
         net: NetConfig {
             listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
             enable_mdns: false,
+            ..NetConfig::default()
         },
         // Tests drive media pipelines by hand; never open real devices.
         call_audio: false,

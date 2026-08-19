@@ -15,7 +15,7 @@ frame exactly once, regardless of how many people watch.**
 | 2 | Unidirectional stream transport, no per-frame acks, per-peer latest-wins queues | **Done** for video |
 | 3 | Weak-machine encoding: screen-content codec, 5–15 fps, static-frame awareness | **Done pragmatically** (software OpenH264; temporal layers deferred) |
 | 4 | Viewer→sharer feedback loop + forwarder keyframe cache | **Partially done** — implicit keyframe demand only; explicit feedback deferred |
-| 5 | NAT traversal (relay / dcutr / autonat) | **Absent**, unchanged — next milestones |
+| 5 | NAT traversal (relay / dcutr / autonat) | **Done** (M18) — see below |
 
 ## What M16 implements
 
@@ -112,11 +112,20 @@ the *implicit* feedback loop; the explicit one is deferred (below).
   received-rate/loss, and the encoder does not adapt bitrate. The
   signaling idiom for it exists (`CallAction`, the `Mute` pattern); it was
   deliberately not added until there is an adaptation policy to serve.
-- **NAT traversal (point 5).** No `relay`, `dcutr`, or `autonat`
-  behaviours are composed into the swarm yet — off-LAN viewers behind NAT
-  still cannot connect at all. Stock rust-libp2p behaviours; prerequisite
-  for any off-LAN use, and publicly-reachable peers double as forwarder
-  candidates for point 1.
+- **NAT traversal (point 5) — done in M18.** The swarm now composes the
+  stock rust-libp2p behaviours: autonat v1 (every node probes its own
+  reachability *and* serves probes for others), the circuit-relay v2
+  service (every mikall node donates modest, capped relay capacity by
+  default — the peer-run relay model), the relay client + `/p2p-circuit`
+  transport (a probed-private node automatically reserves a slot on a
+  connected public peer and publishes the resulting circuit address in
+  its listen-address list — the settings → network pane shows it with
+  zero new UI), and DCUtR hole punching to upgrade relayed connections to
+  direct ones. Relay limits are deliberately tight (8 reservations, 8
+  circuits, 10 min / 8 MiB per direction per circuit), so media over a relay is a
+  bridge until DCUtR lands, not a plan — see `docs/protocol.md` for the
+  numbers and the honest failure mode. Publicly-reachable peers double as
+  forwarder candidates for point 1, exactly as intended.
 - **Voice on streams.** See transport section above.
 
 ## Honest v1 constraints

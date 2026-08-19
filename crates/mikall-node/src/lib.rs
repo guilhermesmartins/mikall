@@ -301,10 +301,17 @@ async fn redial_remembered_peers(identity: Arc<IdentityService>, net: NetControl
     for addr in &remembered {
         match addr.as_str().parse::<Multiaddr>() {
             Ok(multiaddr) => {
-                let peer = multiaddr.iter().find_map(|p| match p {
-                    Protocol::P2p(peer) => Some(peer),
-                    _ => None,
-                });
+                // The *last* `/p2p/` component is the target peer: a
+                // relayed `/…/p2p/RELAY/p2p-circuit/p2p/PEER` address
+                // names the relay first, and we must not credit a mere
+                // relay connection as "reconnected to the peer".
+                let peer = multiaddr
+                    .iter()
+                    .filter_map(|p| match p {
+                        Protocol::P2p(peer) => Some(peer),
+                        _ => None,
+                    })
+                    .last();
                 targets.push((multiaddr, peer));
             }
             Err(error) => {
