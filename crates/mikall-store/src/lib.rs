@@ -23,7 +23,8 @@ use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 use mikall_app::ports::{
-    MessageStore, ProfileRecord, ProfileStore, ProfileStoreError, StoreError, WireMessage,
+    GatewayPort, IrcGatewayConfig, MessageStore, ProfileRecord, ProfileStore, ProfileStoreError,
+    StoreError, WireMessage,
 };
 use mikall_domain::messaging::{ChannelId, MessageId, Nickname};
 use mikall_domain::shared::IdentityId;
@@ -80,12 +81,34 @@ impl From<StoredMessage> for WireMessage {
 struct StoredProfile {
     #[serde(default)]
     nickname: Option<String>,
+    #[serde(default)]
+    irc: Option<StoredIrcGateway>,
+    #[serde(default)]
+    blocked: Vec<[u8; 32]>,
+}
+
+/// The IRC-gateway slice of [`StoredProfile`], mirroring
+/// [`IrcGatewayConfig`] field for field.
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredIrcGateway {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    port: u16,
+    #[serde(default)]
+    password: Option<String>,
 }
 
 impl From<&ProfileRecord> for StoredProfile {
     fn from(r: &ProfileRecord) -> Self {
         StoredProfile {
             nickname: r.nickname.as_ref().map(|n| n.as_str().to_owned()),
+            irc: r.irc.as_ref().map(|irc| StoredIrcGateway {
+                enabled: irc.enabled,
+                port: irc.port.get(),
+                password: irc.password.clone(),
+            }),
+            blocked: r.blocked.iter().map(|id| *id.as_bytes()).collect(),
         }
     }
 }
@@ -100,7 +123,23 @@ impl TryFrom<StoredProfile> for ProfileRecord {
             .map(Nickname::parse)
             .transpose()
             .map_err(|e| ProfileStoreError::Other(format!("stored nickname invalid: {e}")))?;
-        Ok(ProfileRecord { nickname })
+        let irc = s
+            .irc
+            .map(|irc| {
+                Ok(IrcGatewayConfig {
+                    enabled: irc.enabled,
+                    port: GatewayPort::new(irc.port).map_err(|e| {
+                        ProfileStoreError::Other(format!("stored gateway port invalid: {e}"))
+                    })?,
+                    password: irc.password,
+                })
+            })
+            .transpose()?;
+        Ok(ProfileRecord {
+            nickname,
+            irc,
+            blocked: s.blocked.into_iter().map(IdentityId::from_bytes).collect(),
+        })
     }
 }
 
@@ -303,6 +342,7 @@ mod tests {
 
         let record = ProfileRecord {
             nickname: Some(Nickname::parse("miku").unwrap()),
+            ..ProfileRecord::default()
         };
         store.save(&record).await.unwrap();
         assert_eq!(store.load().await.unwrap(), record);
@@ -310,6 +350,7 @@ mod tests {
         // Saving again overwrites the single row rather than appending.
         let renamed = ProfileRecord {
             nickname: Some(Nickname::parse("rin").unwrap()),
+            ..ProfileRecord::default()
         };
         store.save(&renamed).await.unwrap();
         assert_eq!(store.load().await.unwrap(), renamed);
@@ -318,6 +359,49 @@ mod tests {
         drop(store);
         let reopened = RedbStore::open(&path).unwrap();
         assert_eq!(reopened.load().await.unwrap(), renamed);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn irc_settings_and_blocklist_roundtrip_and_survive_reopen() {
+        let dir = std::env::temp_dir().join(format!("mikall-redb-irc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.redb");
+
+        let store = RedbStore::open(&path).unwrap();
+        // A record written before the fields existed (nickname only) still
+        // decodes: the settings come back as "never configured".
+        store
+            .save(&ProfileRecord {
+                nickname: Some(Nickname::parse("miku").unwrap()),
+                ..ProfileRecord::default()
+            })
+            .await
+            .unwrap();
+        let loaded = store.load().await.unwrap();
+        assert_eq!(loaded.irc, None);
+        assert!(loaded.blocked.is_empty());
+
+        // Read-modify-write in the settings writer keeps the nickname.
+        let mut record = store.load().await.unwrap();
+        record.irc = Some(IrcGatewayConfig {
+            enabled: true,
+            port: GatewayPort::new(6668).unwrap(),
+            password: Some("negi".to_owned()),
+        });
+        record.blocked = vec![IdentityId::from_bytes([7; 32])];
+        store.save(&record).await.unwrap();
+
+        drop(store);
+        let reopened = RedbStore::open(&path).unwrap();
+        let loaded = reopened.load().await.unwrap();
+        assert_eq!(loaded.nickname, Some(Nickname::parse("miku").unwrap()));
+        let irc = loaded.irc.unwrap();
+        assert!(irc.enabled);
+        assert_eq!(irc.port.get(), 6668);
+        assert_eq!(irc.password.as_deref(), Some("negi"));
+        assert_eq!(loaded.blocked, vec![IdentityId::from_bytes([7; 32])]);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -333,6 +417,7 @@ mod tests {
         store
             .save(&ProfileRecord {
                 nickname: Some(Nickname::parse("miku").unwrap()),
+                ..ProfileRecord::default()
             })
             .await
             .unwrap();

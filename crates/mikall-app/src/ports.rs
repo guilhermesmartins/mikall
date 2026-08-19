@@ -159,14 +159,66 @@ pub enum ProfileStoreError {
     Other(String),
 }
 
+/// A TCP port the IRC gateway may listen on: non-privileged, user-space
+/// (`1024..=65535`). The loopback-only rule lives in `mikall-irc`'s
+/// `IrcBindAddr`; this object only rules out ports that would need root or
+/// mean "pick for me" — a persisted setting must name a real port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GatewayPort(u16);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("gateway port must be 1024..=65535")]
+pub struct GatewayPortError;
+
+impl GatewayPort {
+    /// The IRC default, 6667.
+    pub const DEFAULT: GatewayPort = GatewayPort(6667);
+
+    pub fn new(port: u16) -> Result<Self, GatewayPortError> {
+        if port >= 1024 {
+            Ok(GatewayPort(port))
+        } else {
+            Err(GatewayPortError)
+        }
+    }
+
+    pub fn get(self) -> u16 {
+        self.0
+    }
+}
+
+impl Default for GatewayPort {
+    fn default() -> Self {
+        GatewayPort::DEFAULT
+    }
+}
+
+/// The persisted IRC-gateway choice: off by default, port 6667, no
+/// password. One struct rather than three loose record fields so a save
+/// can never tear the setting apart.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IrcGatewayConfig {
+    /// Whether the gateway starts with the node.
+    pub enabled: bool,
+    pub port: GatewayPort,
+    /// Recommended on shared machines — the gateway is plaintext on
+    /// loopback and other local users can reach loopback ports.
+    pub password: Option<String>,
+}
+
 /// The locally persisted slice of the profile. Every field is `Option` +
-/// `Default` so later milestones (IRC gateway config, local settings) add
-/// fields here without changing the [`ProfileStore`] trait and without
-/// invalidating records written before the field existed.
+/// `Default` (or an empty collection) so later milestones add fields here
+/// without changing the [`ProfileStore`] trait and without invalidating
+/// records written before the field existed.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ProfileRecord {
     /// The announced nickname, once the user has chosen one.
     pub nickname: Option<Nickname>,
+    /// IRC gateway settings; `None` means never configured (defaults).
+    pub irc: Option<IrcGatewayConfig>,
+    /// Locally blocked identities — bans are local on a decentralized
+    /// network, and they survive a restart.
+    pub blocked: Vec<IdentityId>,
 }
 
 /// Local persistence of the profile record (redb in production). Callers
@@ -306,4 +358,32 @@ pub trait FileTransport: Send + Sync {
         root: mikall_domain::transfer::BlobHash,
         index: u32,
     ) -> Result<Vec<u8>, TransportError>;
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn gateway_port_accepts_user_space_only() {
+        assert!(GatewayPort::new(1023).is_err());
+        assert!(GatewayPort::new(0).is_err());
+        assert_eq!(GatewayPort::new(1024).unwrap().get(), 1024);
+        assert_eq!(GatewayPort::new(65535).unwrap().get(), 65535);
+        assert_eq!(GatewayPort::default().get(), 6667);
+    }
+
+    #[test]
+    fn profile_record_defaults_stay_quiet() {
+        let record = ProfileRecord::default();
+        assert_eq!(record.nickname, None);
+        assert_eq!(record.irc, None);
+        assert!(record.blocked.is_empty());
+        let irc = IrcGatewayConfig::default();
+        assert!(!irc.enabled);
+        assert_eq!(irc.port.get(), 6667);
+        assert_eq!(irc.password, None);
+    }
 }

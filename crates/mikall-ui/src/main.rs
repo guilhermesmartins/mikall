@@ -10,6 +10,7 @@ mod theme;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use iced::widget::{
@@ -18,6 +19,7 @@ use iced::widget::{
 use iced::{Element, Fill, Font, Subscription, Task};
 
 use mikall_app::events::AppEvent;
+use mikall_app::ports::{GatewayPort, IrcGatewayConfig};
 use mikall_app::services::{CallSnapshot, MemberView, RenderedMessage};
 use mikall_domain::calls::{CallEvent, CallId, CallPhase, CallRoster, EndReason, MediaState};
 use mikall_domain::identity::IdentityEvent;
@@ -51,6 +53,24 @@ fn data_dir() -> PathBuf {
                 .map(|home| PathBuf::from(home).join(".mikall"))
         })
         .unwrap_or_else(|| PathBuf::from("./mikall-data"))
+}
+
+/// Copy the identity key file to `~/Downloads/mikall-identity.key`,
+/// keeping owner-only permissions. Key custody stays in mikall-crypto —
+/// this is a byte-for-byte file copy of the backup the user asked for.
+fn export_key_file(source: &std::path::Path) -> Result<String, String> {
+    let home = std::env::var("HOME").map_err(|_| "no HOME directory to export into".to_owned())?;
+    let dest_dir = PathBuf::from(home).join("Downloads");
+    std::fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
+    let dest = dest_dir.join("mikall-identity.key");
+    std::fs::copy(source, &dest).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(dest.display().to_string())
 }
 
 /// Advisory wall-clock hint (ordering is causal): hh:mm, UTC.
@@ -116,12 +136,79 @@ struct CallUi {
     watching: Option<IdentityId>,
 }
 
+/// The abortable accept-loop of a running gateway. `mikall_irc::serve`
+/// hands back a `JoinHandle`; keeping it (instead of M7's `_task` drop) is
+/// what makes the settings toggle able to stop the gateway live. Wrapped in
+/// `Arc<Mutex<Option<…>>>` so it can ride inside a `Msg` (which must be
+/// `Clone`) and be taken exactly once.
+#[derive(Debug, Clone)]
+struct GatewayTask(Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>);
+
+impl GatewayTask {
+    fn new(task: tokio::task::JoinHandle<()>) -> Self {
+        GatewayTask(Arc::new(std::sync::Mutex::new(Some(task))))
+    }
+
+    /// Abort the accept loop: the listener drops and the port closes.
+    /// Already-connected IRC sessions run on their own tasks and keep
+    /// their connections until they disconnect.
+    fn abort(&self) {
+        if let Ok(mut guard) = self.0.lock() {
+            if let Some(task) = guard.take() {
+                task.abort();
+            }
+        }
+    }
+}
+
+/// A gateway that came up: where it listens, whether the environment forced
+/// it (`MIKALL_IRC` wins over the persisted setting), and its abort handle.
+#[derive(Debug, Clone)]
+struct GatewayUp {
+    addr: String,
+    env_forced: bool,
+    task: GatewayTask,
+}
+
+/// Runtime state of the loopback IRC gateway, distinct from the *persisted*
+/// choice (`Mikall::irc_cfg`): env override or a start failure can make the
+/// two disagree, and the settings screen shows the runtime truth.
+#[derive(Debug)]
+enum GatewayState {
+    Stopped,
+    Starting { env_forced: bool },
+    Running(GatewayUp),
+}
+
+/// Local state of the settings surface: the gateway inputs being edited and
+/// the two-step key-export confirmation.
+#[derive(Debug)]
+struct SettingsUi {
+    port_input: String,
+    pass_input: String,
+    export_armed: bool,
+}
+
 #[derive(Debug, Clone)]
 enum Msg {
     Booted(Result<NodeHandle, String>),
     NickLoaded(Option<String>),
     ChannelsLoaded(Vec<ChannelName>),
-    IrcGateway(Result<String, String>),
+    IrcConfigLoaded(IrcGatewayConfig),
+    IrcGateway(Result<GatewayUp, String>),
+    IrcToggle,
+    IrcPortInput(String),
+    IrcPassInput(String),
+    IrcSave,
+    OpenSettings,
+    CloseSettings,
+    BlockedLoaded(Vec<(IdentityId, Option<Nickname>)>),
+    Unblock(IdentityId),
+    CopyKeyPath,
+    ExportKeyArm,
+    ExportKeyCancel,
+    ExportKeyConfirm,
+    KeyExported(Result<String, String>),
     NickInput(String),
     ConfirmNick,
     CopyFingerprint,
@@ -181,6 +268,20 @@ struct Mikall {
     call_backlog: Vec<CallId>,
     /// Alternates while ringing to drive the strip's gentle edge pulse.
     ring_glow: bool,
+    /// The settings surface, when open. It replaces the three panes inside
+    /// `view_main`, so the alarm slot and call strip stay visible above it.
+    settings: Option<SettingsUi>,
+    /// Runtime state of the loopback IRC gateway.
+    gateway: GatewayState,
+    /// The persisted gateway choice, hydrated at boot and kept in step
+    /// with every save — the source for the settings inputs.
+    irc_cfg: IrcGatewayConfig,
+    /// Blocked identities for the settings blocklist (refreshed on open
+    /// and on `ContactBlocked`).
+    blocked: Vec<(IdentityId, Option<Nickname>)>,
+    /// Where the identity key file lives — custody stays in mikall-crypto;
+    /// the settings screen only names (and offers to copy) the file.
+    key_path: PathBuf,
 }
 
 impl Mikall {
@@ -205,6 +306,11 @@ impl Mikall {
             call: None,
             call_backlog: Vec::new(),
             ring_glow: false,
+            settings: None,
+            gateway: GatewayState::Stopped,
+            irc_cfg: IrcGatewayConfig::default(),
+            blocked: Vec::new(),
+            key_path: data_dir().join("identity.key"),
         };
         let task = Task::perform(
             async {
@@ -278,20 +384,19 @@ impl Mikall {
         )
     }
 
-    /// Serve RFC 1459 on loopback when MIKALL_IRC=<port> is set — the same
-    /// gateway `mikalld` offers, so WeeChat sits beside this window.
-    fn start_irc_gateway(node: &NodeHandle) -> Task<Msg> {
-        let port = match std::env::var("MIKALL_IRC") {
-            Ok(raw) => match raw.parse::<u16>() {
-                Ok(port) => port,
-                Err(_) => {
-                    return Task::done(Msg::IrcGateway(Err(
-                        "MIKALL_IRC must be a port number".to_owned()
-                    )))
-                }
-            },
-            Err(_) => return Task::none(),
+    /// Serve RFC 1459 on loopback — the same gateway `mikalld` offers, so
+    /// WeeChat sits beside this window. The returned task's `JoinHandle`
+    /// rides back inside [`GatewayUp`] so the settings toggle can stop it.
+    fn start_gateway(
+        &mut self,
+        port: u16,
+        password: Option<String>,
+        env_forced: bool,
+    ) -> Task<Msg> {
+        let Some(node) = self.node() else {
+            return Task::none();
         };
+        self.gateway = GatewayState::Starting { env_forced };
         let services = mikall_irc::GatewayServices {
             identity: node.identity.clone(),
             chat: node.chat.clone(),
@@ -301,16 +406,58 @@ impl Mikall {
         };
         let config = mikall_irc::IrcConfig {
             bind: mikall_irc::IrcBindAddr::localhost(port),
-            password: std::env::var("MIKALL_IRC_PASS").ok(),
+            password,
         };
         Task::perform(
             async move {
                 mikall_irc::serve(services, config)
                     .await
-                    .map(|(addr, _task)| addr.to_string())
+                    .map(|(addr, task)| GatewayUp {
+                        addr: addr.to_string(),
+                        env_forced,
+                        task: GatewayTask::new(task),
+                    })
                     .map_err(|e| e.to_string())
             },
             Msg::IrcGateway,
+        )
+    }
+
+    /// Persist the current gateway choice through the identity service —
+    /// the single settings writer, so a save keeps every other field.
+    fn persist_irc_cfg(&self) -> Task<Msg> {
+        let Some(node) = self.node() else {
+            return Task::none();
+        };
+        let config = self.irc_cfg.clone();
+        Task::perform(
+            async move { node.identity.set_irc_config(config).await },
+            |_| Msg::Noop,
+        )
+    }
+
+    /// The gateway inputs of an open settings surface, parsed: a valid
+    /// user-space port and the password (empty means none).
+    fn settings_gateway_input(&self) -> Option<(GatewayPort, Option<String>)> {
+        let settings = self.settings.as_ref()?;
+        let port = settings
+            .port_input
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .and_then(|raw| GatewayPort::new(raw).ok())?;
+        let password = Some(settings.pass_input.clone()).filter(|p| !p.is_empty());
+        Some((port, password))
+    }
+
+    /// Refresh the settings blocklist from the identity service.
+    fn load_blocked(&self) -> Task<Msg> {
+        let Some(node) = self.node() else {
+            return Task::none();
+        };
+        Task::perform(
+            async move { node.identity.blocked_contacts().await },
+            Msg::BlockedLoaded,
         )
     }
 
@@ -422,13 +569,19 @@ impl Mikall {
             Msg::Booted(Ok(node)) => {
                 self.fingerprint = node.identity.fingerprint().display_groups();
                 let identity = node.identity.clone();
-                let gateway = Self::start_irc_gateway(&node);
+                let identity_cfg = node.identity.clone();
                 self.node = Some(node);
                 let nick = Task::perform(
                     async move { identity.nickname().await.map(|n| n.as_str().to_owned()) },
                     Msg::NickLoaded,
                 );
-                Task::batch([nick, self.load_channels(), gateway])
+                // The persisted gateway choice decides whether the gateway
+                // starts; `Msg::IrcConfigLoaded` applies the env override.
+                let irc = Task::perform(
+                    async move { identity_cfg.irc_config().await },
+                    Msg::IrcConfigLoaded,
+                );
+                Task::batch([nick, self.load_channels(), irc])
             }
             Msg::Booted(Err(error)) => {
                 self.screen = Screen::Failed(error);
@@ -458,15 +611,175 @@ impl Mikall {
                 }
                 Task::none()
             }
-            Msg::IrcGateway(Ok(addr)) => {
+            Msg::IrcConfigLoaded(config) => {
+                self.irc_cfg = config;
+                // If the settings surface opened before the hydrated config
+                // arrived (a boot-time race), refresh its inputs so they
+                // show the persisted values, not the defaults.
+                if let Some(settings) = &mut self.settings {
+                    settings.port_input = self.irc_cfg.port.get().to_string();
+                    settings.pass_input = self.irc_cfg.password.clone().unwrap_or_default();
+                }
+                // Env override wins: MIKALL_IRC forces the gateway on for
+                // this session, whatever the persisted choice says.
+                match std::env::var("MIKALL_IRC") {
+                    Ok(raw) => match raw.parse::<u16>() {
+                        Ok(port) => {
+                            self.start_gateway(port, std::env::var("MIKALL_IRC_PASS").ok(), true)
+                        }
+                        Err(_) => Task::done(Msg::IrcGateway(Err(
+                            "MIKALL_IRC must be a port number".to_owned(),
+                        ))),
+                    },
+                    Err(_) if self.irc_cfg.enabled => {
+                        let port = self.irc_cfg.port.get();
+                        let password = self.irc_cfg.password.clone();
+                        self.start_gateway(port, password, false)
+                    }
+                    Err(_) => Task::none(),
+                }
+            }
+            Msg::IrcGateway(Ok(up)) => {
                 self.alarm = Some(Alarm::Info {
-                    body: format!("irc gateway on {addr} — plaintext, loopback only"),
+                    body: if up.env_forced {
+                        format!(
+                            "irc gateway on {} — plaintext, loopback only · forced by MIKALL_IRC",
+                            up.addr
+                        )
+                    } else {
+                        format!("irc gateway on {} — plaintext, loopback only", up.addr)
+                    },
                 });
+                self.gateway = GatewayState::Running(up);
                 Task::none()
             }
             Msg::IrcGateway(Err(error)) => {
+                self.gateway = GatewayState::Stopped;
                 self.alarm = Some(Alarm::Danger {
                     title: "IRC GATEWAY",
+                    body: error,
+                });
+                Task::none()
+            }
+            Msg::IrcToggle => match &self.gateway {
+                GatewayState::Running(up) if !up.env_forced => {
+                    // Stop live *and* persist the choice — a toggle that
+                    // forgot itself on restart would be a bug, not a quirk.
+                    up.task.abort();
+                    self.gateway = GatewayState::Stopped;
+                    self.irc_cfg.enabled = false;
+                    self.persist_irc_cfg()
+                }
+                GatewayState::Stopped => {
+                    let Some((port, password)) = self.settings_gateway_input() else {
+                        return Task::none();
+                    };
+                    self.irc_cfg = IrcGatewayConfig {
+                        enabled: true,
+                        port,
+                        password: password.clone(),
+                    };
+                    let start = self.start_gateway(port.get(), password, false);
+                    Task::batch([self.persist_irc_cfg(), start])
+                }
+                GatewayState::Running(_) | GatewayState::Starting { .. } => Task::none(),
+            },
+            Msg::IrcPortInput(value) => {
+                if let Some(settings) = &mut self.settings {
+                    settings.port_input = value;
+                }
+                Task::none()
+            }
+            Msg::IrcPassInput(value) => {
+                if let Some(settings) = &mut self.settings {
+                    settings.pass_input = value;
+                }
+                Task::none()
+            }
+            Msg::IrcSave => {
+                let Some((port, password)) = self.settings_gateway_input() else {
+                    return Task::none();
+                };
+                self.irc_cfg.port = port;
+                self.irc_cfg.password = password.clone();
+                let persist = self.persist_irc_cfg();
+                match &self.gateway {
+                    // Saving while the gateway runs applies live: restart
+                    // on the new port/password.
+                    GatewayState::Running(up) if !up.env_forced => {
+                        up.task.abort();
+                        let start = self.start_gateway(port.get(), password, false);
+                        Task::batch([persist, start])
+                    }
+                    GatewayState::Running(_)
+                    | GatewayState::Starting { .. }
+                    | GatewayState::Stopped => {
+                        self.alarm = Some(Alarm::Info {
+                            body: "irc gateway settings saved".to_owned(),
+                        });
+                        persist
+                    }
+                }
+            }
+            Msg::OpenSettings => {
+                self.settings = Some(SettingsUi {
+                    port_input: self.irc_cfg.port.get().to_string(),
+                    pass_input: self.irc_cfg.password.clone().unwrap_or_default(),
+                    export_armed: false,
+                });
+                self.load_blocked()
+            }
+            Msg::CloseSettings => {
+                self.settings = None;
+                Task::none()
+            }
+            Msg::BlockedLoaded(blocked) => {
+                self.blocked = blocked;
+                Task::none()
+            }
+            Msg::Unblock(id) => {
+                let Some(node) = self.node() else {
+                    return Task::none();
+                };
+                Task::perform(
+                    async move {
+                        node.identity.unblock(id).await;
+                        node.identity.blocked_contacts().await
+                    },
+                    Msg::BlockedLoaded,
+                )
+            }
+            Msg::CopyKeyPath => iced::clipboard::write(self.key_path.display().to_string()),
+            Msg::ExportKeyArm => {
+                if let Some(settings) = &mut self.settings {
+                    settings.export_armed = true;
+                }
+                Task::none()
+            }
+            Msg::ExportKeyCancel => {
+                if let Some(settings) = &mut self.settings {
+                    settings.export_armed = false;
+                }
+                Task::none()
+            }
+            Msg::ExportKeyConfirm => {
+                if let Some(settings) = &mut self.settings {
+                    settings.export_armed = false;
+                }
+                let source = self.key_path.clone();
+                Task::perform(async move { export_key_file(&source) }, Msg::KeyExported)
+            }
+            Msg::KeyExported(Ok(path)) => {
+                self.alarm = Some(Alarm::Info {
+                    body: format!(
+                        "key file copied to {path} — move it somewhere offline, then delete the copy"
+                    ),
+                });
+                Task::none()
+            }
+            Msg::KeyExported(Err(error)) => {
+                self.alarm = Some(Alarm::Danger {
+                    title: "KEY EXPORT",
                     body: error,
                 });
                 Task::none()
@@ -829,6 +1142,15 @@ impl Mikall {
             | AppEvent::Domain(DomainEvent::Messaging(MessagingEvent::ChannelLeft { .. })) => {
                 self.reload_active()
             }
+            AppEvent::Domain(DomainEvent::Identity(IdentityEvent::ContactBlocked { .. })) => {
+                // A block from any frontend (IRC MODE +b) lands in the
+                // settings blocklist while it is open.
+                if self.settings.is_some() {
+                    self.load_blocked()
+                } else {
+                    Task::none()
+                }
+            }
             AppEvent::Domain(DomainEvent::Presence(_)) => self.load_presence(),
             AppEvent::Domain(DomainEvent::Calls(event)) => self.handle_call_event(event),
             AppEvent::TransferSaved { path, .. } => {
@@ -913,15 +1235,21 @@ impl Mikall {
                 }
             }),
         );
+        let mut subs = vec![events];
         if self.call_is_ringing() {
             // The pulse only ticks while something actually rings.
-            Subscription::batch([
-                events,
-                iced::time::every(Duration::from_millis(700)).map(|_| Msg::RingPulse),
-            ])
-        } else {
-            events
+            subs.push(iced::time::every(Duration::from_millis(700)).map(|_| Msg::RingPulse));
         }
+        if self.settings.is_some() {
+            // Esc closes the settings surface (keyboard-friendly, §6).
+            subs.push(iced::keyboard::on_key_press(|key, _modifiers| match key {
+                iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) => {
+                    Some(Msg::CloseSettings)
+                }
+                _ => None,
+            }));
+        }
+        Subscription::batch(subs)
     }
 
     fn view(&self) -> Element<'_, Msg> {
@@ -1047,6 +1375,12 @@ impl Mikall {
         // three-pane body is never touched.
         if let Some(surface) = self.view_call() {
             root = root.push(surface);
+        }
+        // The settings surface replaces the three panes but docks below the
+        // alarm slot and call strip, so a key-change alarm or a ringing
+        // call is never hidden by it.
+        if let Some(settings) = &self.settings {
+            return root.push(self.view_settings(settings)).into();
         }
         let body = row![self.view_sidebar(), self.view_chat()]
             .push_maybe((self.show_roster && self.active.is_some()).then(|| self.view_roster()));
@@ -1535,6 +1869,10 @@ impl Mikall {
                     .size(13)
                     .font(SEMIBOLD)
                     .width(Fill),
+                button(text("settings").size(10).font(MONO))
+                    .style(theme::ghost)
+                    .padding([2, 8])
+                    .on_press(Msg::OpenSettings),
             ]
             .spacing(8)
             .align_y(iced::Center),
@@ -1790,6 +2128,323 @@ impl Mikall {
             .width(180)
             .height(Fill)
             .style(theme::panel)
+            .into()
+    }
+
+    /// The settings surface (brief §3.5 — modest, one screen): identity &
+    /// key backup, the IRC gateway, the privacy block, and the blocklist.
+    fn view_settings<'a>(&'a self, settings: &'a SettingsUi) -> Element<'a, Msg> {
+        let header = row![
+            text("settings").size(20).color(theme::TEAL).width(Fill),
+            button(text("back · esc").size(11).font(MONO))
+                .style(theme::ghost)
+                .padding([4, 12])
+                .on_press(Msg::CloseSettings),
+        ]
+        .align_y(iced::Center);
+
+        let content = column![
+            header,
+            self.view_settings_identity(settings),
+            self.view_settings_gateway(settings),
+            Self::view_settings_privacy(),
+            self.view_settings_blocklist(),
+        ]
+        .spacing(14)
+        .max_width(660);
+
+        scrollable(container(content).padding([18, 24]).center_x(Fill))
+            .height(Fill)
+            .width(Fill)
+            .into()
+    }
+
+    fn view_settings_identity<'a>(&'a self, settings: &'a SettingsUi) -> Element<'a, Msg> {
+        let groups: Vec<&str> = self.fingerprint.split('-').collect();
+        let (fp_top, fp_bottom) = if groups.len() == 8 {
+            (groups[..4].join("-"), groups[4..].join("-"))
+        } else {
+            (self.fingerprint.clone(), String::new())
+        };
+
+        let export: Element<'_, Msg> = if settings.export_armed {
+            column![
+                text("this file IS your identity — anyone holding it can be you. export a copy to ~/Downloads?")
+                    .size(12)
+                    .color(theme::DANGER),
+                row![
+                    button(text("yes, export the key file").size(12).font(MONO))
+                        .style(theme::danger_outline)
+                        .padding([5, 14])
+                        .on_press(Msg::ExportKeyConfirm),
+                    button(text("cancel").size(12).font(MONO))
+                        .style(theme::ghost)
+                        .padding([5, 14])
+                        .on_press(Msg::ExportKeyCancel),
+                ]
+                .spacing(10),
+            ]
+            .spacing(8)
+            .into()
+        } else {
+            button(text("export key file…").size(12).font(MONO))
+                .style(theme::danger_outline)
+                .padding([5, 14])
+                .on_press(Msg::ExportKeyArm)
+                .into()
+        };
+
+        container(
+            column![
+                row![
+                    text("IDENTITY")
+                        .size(10)
+                        .font(MONO)
+                        .color(theme::TEAL)
+                        .width(Fill),
+                    button(text("copy fingerprint").size(11).font(MONO))
+                        .style(theme::ghost)
+                        .padding([3, 10])
+                        .on_press(Msg::CopyFingerprint),
+                ]
+                .align_y(iced::Center),
+                Space::with_height(8),
+                text(fp_top).size(16).font(MONO),
+                text(fp_bottom).size(16).font(MONO),
+                Space::with_height(4),
+                text("nicknames are labels — this fingerprint is who you are")
+                    .size(11)
+                    .color(theme::MUTED),
+                Space::with_height(12),
+                container(Space::new(Fill, 1)).style(theme::hairline),
+                Space::with_height(12),
+                text("KEY BACKUP").size(10).font(MONO).color(theme::MUTED),
+                Space::with_height(6),
+                row![
+                    text(self.key_path.display().to_string())
+                        .size(11)
+                        .font(MONO)
+                        .color(theme::MUTED)
+                        .width(Fill),
+                    button(text("copy path").size(11).font(MONO))
+                        .style(theme::ghost)
+                        .padding([3, 10])
+                        .on_press(Msg::CopyKeyPath),
+                ]
+                .spacing(10)
+                .align_y(iced::Center),
+                Space::with_height(6),
+                text("lose the key file, lose the identity — there is no recovery")
+                    .size(11)
+                    .font(MONO)
+                    .color(theme::MUTED),
+                Space::with_height(10),
+                export,
+            ]
+            .spacing(2),
+        )
+        .style(theme::card)
+        .padding([16, 20])
+        .width(Fill)
+        .into()
+    }
+
+    fn view_settings_gateway<'a>(&'a self, settings: &'a SettingsUi) -> Element<'a, Msg> {
+        let mut status = Row::new().spacing(8).align_y(iced::Center).push(
+            text("IRC GATEWAY")
+                .size(10)
+                .font(MONO)
+                .color(theme::TEAL)
+                .width(Fill),
+        );
+        match &self.gateway {
+            GatewayState::Running(up) => {
+                status = status.push(
+                    container(text(format!("running on {}", up.addr)).size(10).font(MONO))
+                        .style(theme::chip_teal)
+                        .padding([2, 8]),
+                );
+                if up.env_forced {
+                    status = status.push(text("env-forced").size(10).font(MONO).color(theme::PINK));
+                }
+            }
+            GatewayState::Starting { env_forced } => {
+                status = status.push(text("starting…").size(10).font(MONO).color(theme::MUTED));
+                if *env_forced {
+                    status = status.push(text("env-forced").size(10).font(MONO).color(theme::PINK));
+                }
+            }
+            GatewayState::Stopped => {
+                status = status.push(text("stopped").size(10).font(MONO).color(theme::MUTED));
+            }
+        }
+
+        let port_valid = self.settings_gateway_input().is_some();
+        let port_hint = if port_valid {
+            text("ok").size(10).font(MONO).color(theme::TEAL)
+        } else {
+            text("a port, 1024..=65535")
+                .size(10)
+                .font(MONO)
+                .color(theme::DANGER)
+        };
+        let port_field = column![
+            text("PORT").size(10).font(MONO).color(theme::MUTED),
+            text_input("6667", &settings.port_input)
+                .on_input(Msg::IrcPortInput)
+                .style(theme::input)
+                .font(MONO)
+                .padding(8)
+                .size(13)
+                .width(110),
+            port_hint,
+        ]
+        .spacing(5);
+        let pass_field = column![
+            text("PASSWORD — OPTIONAL")
+                .size(10)
+                .font(MONO)
+                .color(theme::MUTED),
+            text_input("no password", &settings.pass_input)
+                .on_input(Msg::IrcPassInput)
+                .secure(true)
+                .style(theme::input)
+                .font(MONO)
+                .padding(8)
+                .size(13),
+            text("the gateway is plaintext on loopback — set a password on shared machines")
+                .size(10)
+                .font(MONO)
+                .color(theme::MUTED),
+        ]
+        .spacing(5)
+        .width(Fill);
+
+        let toggle: Element<'_, Msg> = match &self.gateway {
+            GatewayState::Running(up) if !up.env_forced => {
+                button(text("stop gateway").size(12).font(MONO))
+                    .style(theme::danger_outline)
+                    .padding([5, 14])
+                    .on_press(Msg::IrcToggle)
+                    .into()
+            }
+            GatewayState::Running(_) => {
+                text("forced on by MIKALL_IRC — unset it to control the gateway here")
+                    .size(11)
+                    .font(MONO)
+                    .color(theme::PINK)
+                    .into()
+            }
+            GatewayState::Starting { .. } => button(text("starting…").size(12).font(MONO))
+                .style(theme::ghost)
+                .padding([5, 14])
+                .into(),
+            GatewayState::Stopped => button(text("start gateway").size(12).font(MONO))
+                .style(theme::teal_outline)
+                .padding([5, 14])
+                .on_press_maybe(port_valid.then_some(Msg::IrcToggle))
+                .into(),
+        };
+        let save = button(text("save").size(12).font(SEMIBOLD))
+            .style(theme::primary)
+            .padding([5, 18])
+            .on_press_maybe(port_valid.then_some(Msg::IrcSave));
+
+        container(column![
+            status,
+            Space::with_height(10),
+            row![port_field, pass_field].spacing(14),
+            Space::with_height(10),
+            row![toggle, save].spacing(10).align_y(iced::Center),
+            Space::with_height(8),
+            text(
+                "binds 127.0.0.1 only, by construction — saving while running restarts the gateway"
+            )
+            .size(10)
+            .font(MONO)
+            .color(theme::MUTED),
+        ])
+        .style(theme::card)
+        .padding([16, 20])
+        .width(Fill)
+        .into()
+    }
+
+    /// Brief §3.5: the static honesty block, stated plainly (§5 voice).
+    fn view_settings_privacy() -> Element<'static, Msg> {
+        container(
+            column![
+                text("PRIVACY — PLAINLY")
+                    .size(10)
+                    .font(MONO)
+                    .color(theme::TEAL),
+                Space::with_height(8),
+                text("your IP is visible to the peers you connect with — direct connections are the point")
+                    .size(12),
+                text("bans and blocks are local — there is no global moderator on a decentralized network")
+                    .size(12),
+                text("messages live on peers, not servers — deleting here does not recall them")
+                    .size(12),
+                text("no account recovery — the key file above is the only credential there is")
+                    .size(12),
+                Space::with_height(8),
+                text("the full posture: docs/security.md")
+                    .size(10)
+                    .font(MONO)
+                    .color(theme::MUTED),
+            ]
+            .spacing(4),
+        )
+        .style(theme::card)
+        .padding([16, 20])
+        .width(Fill)
+        .into()
+    }
+
+    fn view_settings_blocklist(&self) -> Element<'_, Msg> {
+        let mut col = Column::new()
+            .spacing(6)
+            .push(text("BLOCKLIST").size(10).font(MONO).color(theme::TEAL))
+            .push(Space::with_height(4));
+        if self.blocked.is_empty() {
+            col = col.push(
+                text("no one is blocked — a block hides a peer's messages on this node only")
+                    .size(12)
+                    .color(theme::MUTED),
+            );
+        } else {
+            for (id, nick) in &self.blocked {
+                let mut entry = Row::new().spacing(10).align_y(iced::Center);
+                if let Some(nick) = nick {
+                    entry = entry.push(text(nick.as_str().to_owned()).size(13).font(SEMIBOLD));
+                }
+                entry = entry.push(
+                    text(shorten(&id.to_string(), 16))
+                        .size(12)
+                        .font(MONO)
+                        .color(theme::MUTED)
+                        .width(Fill),
+                );
+                entry = entry.push(
+                    button(text("unblock").size(11).font(MONO))
+                        .style(theme::ghost)
+                        .padding([3, 10])
+                        .on_press(Msg::Unblock(*id)),
+                );
+                col = col.push(entry);
+            }
+            col = col.push(Space::with_height(4));
+            col = col.push(
+                text("unblocking forgets the peer — they re-pin like any stranger on next sight")
+                    .size(10)
+                    .font(MONO)
+                    .color(theme::MUTED),
+            );
+        }
+        container(col)
+            .style(theme::card)
+            .padding([16, 20])
+            .width(Fill)
             .into()
     }
 }

@@ -10,7 +10,7 @@ use mikall_domain::messaging::Nickname;
 use mikall_domain::shared::{Fingerprint, IdentityId};
 
 use crate::events::EventBus;
-use crate::ports::{Clock, ProfileStore, ProfileStoreError};
+use crate::ports::{Clock, IrcGatewayConfig, ProfileStore, ProfileStoreError};
 
 /// Shared local profile: who we are and what we know about others.
 #[derive(Debug)]
@@ -81,13 +81,23 @@ impl IdentityService {
     }
 
     /// Load the persisted profile record into memory. The composition root
-    /// calls this once at boot, before any frontend attaches — no
-    /// [`IdentityEvent::NicknameChanged`] is published, frontends read the
-    /// result via [`IdentityService::nickname`].
+    /// calls this once at boot, before any frontend attaches — no events
+    /// are published (no `NicknameChanged`, no `ContactBlocked`), frontends
+    /// read the result via [`IdentityService::nickname`],
+    /// [`IdentityService::is_blocked`], and friends.
     pub async fn hydrate(&self) -> Result<(), ProfileStoreError> {
         let record = self.store.load().await?;
         if let Some(nick) = record.nickname {
             *self.profile.nickname.write().await = Some(nick);
+        }
+        let mut contacts = self.profile.contacts.write().await;
+        for id in record.blocked {
+            let contact = contacts.entry(id).or_insert_with(|| {
+                Contact::first_seen(id, Fingerprint::from_bytes([0; 32]), self.clock.now_ms()).0
+            });
+            // Replaying a past decision, not making a new one: the block
+            // event was published when the user chose it.
+            let _ = contact.block();
         }
         Ok(())
     }
@@ -115,6 +125,27 @@ impl IdentityService {
 
     pub async fn nickname(&self) -> Option<Nickname> {
         self.profile.nickname.read().await.clone()
+    }
+
+    /// The persisted IRC-gateway choice, defaults when never configured.
+    /// Best-effort like every profile read: an unreadable record answers
+    /// with the defaults (gateway off) rather than blocking boot.
+    pub async fn irc_config(&self) -> IrcGatewayConfig {
+        self.store
+            .load()
+            .await
+            .unwrap_or_default()
+            .irc
+            .unwrap_or_default()
+    }
+
+    /// Persist the IRC-gateway choice. All profile writes funnel through
+    /// this service and read-modify-write the record, so the nickname and
+    /// blocklist survive a gateway save (and vice versa).
+    pub async fn set_irc_config(&self, config: IrcGatewayConfig) {
+        let mut record = self.store.load().await.unwrap_or_default();
+        record.irc = Some(config);
+        let _ = self.store.save(&record).await;
     }
 
     /// The label we display for an identity: their announced nickname.
@@ -179,12 +210,53 @@ impl IdentityService {
     }
 
     pub async fn block(&self, id: IdentityId) {
-        let mut contacts = self.profile.contacts.write().await;
-        let contact = contacts.entry(id).or_insert_with(|| {
-            Contact::first_seen(id, Fingerprint::from_bytes([0; 32]), self.clock.now_ms()).0
-        });
-        let event = contact.block();
-        self.bus.publish_domain(event);
+        {
+            let mut contacts = self.profile.contacts.write().await;
+            let contact = contacts.entry(id).or_insert_with(|| {
+                Contact::first_seen(id, Fingerprint::from_bytes([0; 32]), self.clock.now_ms()).0
+            });
+            let event = contact.block();
+            self.bus.publish_domain(event);
+        }
+        // A block is a user choice, so it persists (best-effort,
+        // read-modify-write — same discipline as `set_nickname`).
+        let mut record = self.store.load().await.unwrap_or_default();
+        if !record.blocked.contains(&id) {
+            record.blocked.push(id);
+            let _ = self.store.save(&record).await;
+        }
+    }
+
+    /// Undo a block by forgetting the contact entirely: the identity drops
+    /// off the blocklist and, on next sighting, is TOFU-pinned again like
+    /// any stranger. No domain trust transition exists out of `Blocked` —
+    /// pretending the old pin was still trustworthy would be a lie, so we
+    /// honestly start over.
+    pub async fn unblock(&self, id: IdentityId) {
+        {
+            let mut contacts = self.profile.contacts.write().await;
+            if !contacts.get(&id).is_some_and(Contact::is_blocked) {
+                return;
+            }
+            contacts.remove(&id);
+        }
+        let mut record = self.store.load().await.unwrap_or_default();
+        if record.blocked.contains(&id) {
+            record.blocked.retain(|blocked| *blocked != id);
+            let _ = self.store.save(&record).await;
+        }
+    }
+
+    /// Every blocked identity with its announced nickname, if one is known
+    /// — for blocklist management surfaces.
+    pub async fn blocked_contacts(&self) -> Vec<(IdentityId, Option<Nickname>)> {
+        let contacts = self.profile.contacts.read().await;
+        let nicks = self.profile.nicks.read().await;
+        contacts
+            .values()
+            .filter(|contact| contact.is_blocked())
+            .map(|contact| (contact.id(), nicks.get(&contact.id()).cloned()))
+            .collect()
     }
 
     pub async fn is_blocked(&self, id: &IdentityId) -> bool {
