@@ -171,6 +171,35 @@ pub fn chip_danger(_: &Theme) -> container::Style {
     }
 }
 
+/// Media-state chip for the "sharing" state — teal, not danger: a screen
+/// share is a feature in progress, not a fault.
+pub fn chip_teal(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(TEAL_DIM.into()),
+        text_color: Some(TEAL),
+        border: Border {
+            color: Color { a: 0.35, ..TEAL },
+            width: 1.0,
+            radius: border::radius(4),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// The screen-share stage: a near-black 16:9 well where decoded video will
+/// land; until then it hosts the honest placeholder copy.
+pub fn share_stage(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Color::from_rgb(0.031, 0.067, 0.075).into()),
+        border: Border {
+            color: HAIRLINE,
+            width: 1.0,
+            radius: border::radius(8),
+        },
+        ..container::Style::default()
+    }
+}
+
 /// Destructive fill: hang up.
 pub fn danger(_: &Theme, status: button::Status) -> button::Style {
     let fill = match status {
@@ -196,6 +225,22 @@ pub fn danger_outline(_: &Theme, status: button::Status) -> button::Style {
         text_color: DANGER,
         border: Border {
             color: Color { a: 0.5, ..DANGER },
+            width: 1.0,
+            radius: border::radius(6),
+        },
+        ..button::Style::default()
+    }
+}
+
+/// Engaged non-destructive toggle outline ("stop sharing") — the teal
+/// sibling of `danger_outline`.
+pub fn teal_outline(_: &Theme, status: button::Status) -> button::Style {
+    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    button::Style {
+        background: hovered.then(|| TEAL_DIM.into()),
+        text_color: TEAL,
+        border: Border {
+            color: Color { a: 0.5, ..TEAL },
             width: 1.0,
             radius: border::radius(6),
         },

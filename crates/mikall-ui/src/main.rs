@@ -108,6 +108,12 @@ enum Alarm {
 struct CallUi {
     id: CallId,
     snapshot: Option<CallSnapshot>,
+    /// Which remote sharer's viewer pane is expanded. Pure local view
+    /// state — collapsing it never touches the call. It auto-opens when a
+    /// remote `ScreenShareStarted` lands and is reconciled against every
+    /// snapshot, so it can never point at someone the aggregate says
+    /// stopped sharing (or at ourselves).
+    watching: Option<IdentityId>,
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +144,13 @@ enum Msg {
     CallAccept(CallId),
     CallDecline(CallId),
     CallHangUp(CallId),
+    /// Toggle our own screen share (true = start, false = stop).
+    ShareScreen(CallId, bool),
+    /// Expand the viewer pane for a remote sharer (local view only).
+    Watch(IdentityId),
+    /// Collapse the viewer back to tiles (local view only — the sharer
+    /// keeps sharing).
+    StopWatching,
     CallDone(Result<(), String>),
     CallSnapshot(Result<CallSnapshot, String>),
     CallDismiss,
@@ -355,7 +368,11 @@ impl Mikall {
             return Task::none();
         }
         let id = self.call_backlog.remove(0);
-        self.call = Some(CallUi { id, snapshot: None });
+        self.call = Some(CallUi {
+            id,
+            snapshot: None,
+            watching: None,
+        });
         self.refresh_call(id)
     }
 
@@ -624,7 +641,11 @@ impl Mikall {
                 )
             }
             Msg::CallStarted(id) => {
-                self.call = Some(CallUi { id, snapshot: None });
+                self.call = Some(CallUi {
+                    id,
+                    snapshot: None,
+                    watching: None,
+                });
                 self.refresh_call(id)
             }
             Msg::CallAccept(id) => {
@@ -664,6 +685,35 @@ impl Mikall {
                     Msg::CallDone,
                 )
             }
+            Msg::ShareScreen(id, active) => {
+                let Some(node) = self.node() else {
+                    return Task::none();
+                };
+                Task::perform(
+                    async move {
+                        node.calls
+                            .share_screen(id, active)
+                            .await
+                            .map_err(|e| e.to_string())
+                    },
+                    Msg::CallDone,
+                )
+            }
+            Msg::Watch(who) => {
+                // Never watch ourselves — our own share has no viewer.
+                if Some(who) != self.me() {
+                    if let Some(call) = &mut self.call {
+                        call.watching = Some(who);
+                    }
+                }
+                Task::none()
+            }
+            Msg::StopWatching => {
+                if let Some(call) = &mut self.call {
+                    call.watching = None;
+                }
+                Task::none()
+            }
             // Success is silent: the call events land on the bus and the
             // snapshot refresh moves the surface.
             Msg::CallDone(Ok(())) => Task::none(),
@@ -690,6 +740,18 @@ impl Mikall {
                 if unseen_expired_offer {
                     self.call = None;
                     return self.show_next_offer();
+                }
+                // The viewer may only point at a remote participant the
+                // aggregate says is sharing — anyone who stopped or left
+                // collapses it back to tiles.
+                if let Some(peer) = call.watching {
+                    let still_sharing = snapshot
+                        .participants
+                        .iter()
+                        .any(|(who, media)| *who == peer && media.sharing_screen);
+                    if !still_sharing {
+                        call.watching = None;
+                    }
                 }
                 call.snapshot = Some(snapshot);
                 Task::none()
@@ -780,10 +842,13 @@ impl Mikall {
     }
 
     /// Call events never carry UI state — every one triggers a snapshot
-    /// refetch, so the surface always mirrors the aggregate.
+    /// refetch, so the surface always mirrors the aggregate. The one
+    /// exception is `CallUi::watching`, which is local view preference:
+    /// share events open/close the viewer pane here.
     fn handle_call_event(&mut self, event: CallEvent) -> Task<Msg> {
+        let me = self.me();
         if let CallEvent::CallOffered { call, by, .. } = &event {
-            let incoming = Some(*by) != self.me();
+            let incoming = Some(*by) != me;
             if incoming && self.call.as_ref().map(|c| c.id) != Some(*call) {
                 if self.call_in_progress() {
                     // Gentle interruption only: one call surface at a time.
@@ -795,8 +860,26 @@ impl Mikall {
                 self.call = Some(CallUi {
                     id: *call,
                     snapshot: None,
+                    watching: None,
                 });
                 return self.refresh_call(*call);
+            }
+        }
+        if let Some(current) = &mut self.call {
+            match &event {
+                // A remote share just started: open the viewer (brief
+                // §3.3 — "their tile expands or a viewer pane opens").
+                CallEvent::ScreenShareStarted { call, who }
+                    if *call == current.id && Some(*who) != me =>
+                {
+                    current.watching = Some(*who);
+                }
+                CallEvent::ScreenShareStopped { call, who }
+                    if *call == current.id && current.watching == Some(*who) =>
+                {
+                    current.watching = None;
+                }
+                _ => {}
             }
         }
         let id = Self::call_event_id(&event);
@@ -959,9 +1042,9 @@ impl Mikall {
             root = root.push(self.view_alarm(alarm));
         }
         // The call surface docks below the alarm slot, above the panes:
-        // a gentle interruption, never a modal takeover. A future screen-
-        // share viewer pane can grow below this strip without touching
-        // the three-pane body.
+        // a gentle interruption, never a modal takeover. The screen-share
+        // viewer grows inside the active-call view of this strip, so the
+        // three-pane body is never touched.
         if let Some(surface) = self.view_call() {
             root = root.push(surface);
         }
@@ -1079,8 +1162,29 @@ impl Mikall {
 
     /// Active call: participant tiles (max 8, rows of 4) + controls.
     /// Mute/deafen toggles are absent on purpose: no use-case service
-    /// exposes them yet, and a control that does nothing would lie.
+    /// exposes them yet, and a control that does nothing would lie. The
+    /// share-screen toggle is real — it drives `CallService::share_screen`
+    /// and our own state renders from the snapshot, never a local bool.
     fn view_call_active(&self, id: CallId, snapshot: &CallSnapshot) -> Element<'_, Msg> {
+        let me = self.me();
+        let i_am_sharing = snapshot
+            .participants
+            .iter()
+            .any(|(who, media)| Some(*who) == me && media.sharing_screen);
+        // The expanded viewer only ever shows a remote participant the
+        // aggregate says is sharing right now (we never watch ourselves).
+        let watching = self
+            .call
+            .as_ref()
+            .and_then(|call| call.watching)
+            .filter(|peer| {
+                Some(*peer) != me
+                    && snapshot
+                        .participants
+                        .iter()
+                        .any(|(who, media)| who == peer && media.sharing_screen)
+            });
+
         let header = row![
             text("VOICE CALL")
                 .size(11)
@@ -1109,24 +1213,97 @@ impl Mikall {
             grid = grid.push(line);
         }
 
-        let controls = row![button(text("hang up").size(12).font(SEMIBOLD))
-            .style(theme::danger)
-            .padding([6, 20])
-            .on_press(Msg::CallHangUp(id))]
+        let share_toggle = if i_am_sharing {
+            button(text("stop sharing").size(12).font(MONO))
+                .style(theme::teal_outline)
+                .padding([6, 14])
+                .on_press(Msg::ShareScreen(id, false))
+        } else {
+            button(text("share screen").size(12).font(MONO))
+                .style(theme::ghost)
+                .padding([6, 14])
+                .on_press(Msg::ShareScreen(id, true))
+        };
+        let controls = row![
+            share_toggle,
+            button(text("hang up").size(12).font(SEMIBOLD))
+                .style(theme::danger)
+                .padding([6, 20])
+                .on_press(Msg::CallHangUp(id)),
+        ]
         .spacing(10);
 
-        container(
-            column![
-                header,
-                container(grid).center_x(Fill),
-                container(controls).center_x(Fill),
-            ]
-            .spacing(10),
+        let mut body = Column::new().spacing(10).push(header);
+        match watching {
+            // Watching a remote share: the viewer pane replaces the tile
+            // grid; "stop watching" brings the tiles back.
+            Some(peer) => body = body.push(self.view_share_viewer(peer)),
+            None => body = body.push(container(grid).center_x(Fill)),
+        }
+        if i_am_sharing {
+            // Our own share never gets a self-viewer — just the plain
+            // state, said honestly (§5): the share is real signaling, but
+            // nothing captures pixels yet.
+            body = body.push(
+                container(
+                    text("you are sharing your screen — signaled to peers, no pixels captured yet")
+                        .size(10)
+                        .font(MONO)
+                        .color(theme::TEAL),
+                )
+                .center_x(Fill),
+            );
+        }
+        body = body.push(container(controls).center_x(Fill));
+
+        container(body)
+            .style(theme::call_panel)
+            .padding([12, 18])
+            .width(Fill)
+            .into()
+    }
+
+    /// Brief §3.3: when someone shares, a viewer pane opens — a 16:9 area
+    /// with the sharer's nick and "stop watching". Screen-share *signaling*
+    /// is shipped; no decodable video reaches this process yet, so the
+    /// stage renders the honest placeholder instead of a fake image.
+    fn view_share_viewer(&self, peer: IdentityId) -> Element<'_, Msg> {
+        let (label, mono) = self.peer_label(peer);
+        let name = if mono {
+            text(label).size(13).font(MONO)
+        } else {
+            text(label).size(13).font(SEMIBOLD)
+        };
+        let header = row![
+            text("SCREEN SHARE")
+                .size(11)
+                .font(MONO_BOLD)
+                .color(theme::TEAL),
+            name,
+            text("is sharing their screen")
+                .size(12)
+                .color(theme::MUTED)
+                .width(Fill),
+            button(text("stop watching").size(11).font(MONO))
+                .style(theme::ghost)
+                .padding([3, 10])
+                .on_press(Msg::StopWatching),
+        ]
+        .spacing(10)
+        .align_y(iced::Center);
+        let stage = container(
+            text("share signaled — video frames land with the hardware-media milestone")
+                .size(11)
+                .font(MONO)
+                .color(theme::MUTED),
         )
-        .style(theme::call_panel)
-        .padding([12, 18])
-        .width(Fill)
-        .into()
+        .style(theme::share_stage)
+        .center_x(480)
+        .center_y(270);
+        column![header, container(stage).center_x(Fill)]
+            .spacing(8)
+            .width(Fill)
+            .into()
     }
 
     fn view_call_tile(&self, who: IdentityId, media: MediaState) -> Element<'_, Msg> {
@@ -1142,19 +1319,31 @@ impl Mikall {
             head = head.push(text("you").size(9).font(MONO).color(theme::MUTED));
         }
         let mut tile = Column::new().spacing(5).align_x(iced::Center).push(head);
-        // Real per-participant media state from the aggregate. The
-        // sharing_screen flag is deliberately unrendered here — the
-        // screen-share viewer is the next milestone.
+        // Real per-participant media state from the aggregate. Sharing is
+        // teal — a feature, not a fault like a muted mic.
         let mut chips = Row::new().spacing(4);
-        let flagged = media.mic_muted || media.deafened;
+        let flagged = media.mic_muted || media.deafened || media.sharing_screen;
         if media.mic_muted {
-            chips = chips.push(Self::media_chip("mic off"));
+            chips = chips.push(Self::media_chip("mic off", theme::chip_danger));
         }
         if media.deafened {
-            chips = chips.push(Self::media_chip("deafened"));
+            chips = chips.push(Self::media_chip("deafened", theme::chip_danger));
+        }
+        if media.sharing_screen {
+            chips = chips.push(Self::media_chip("sharing", theme::chip_teal));
         }
         if flagged {
             tile = tile.push(chips);
+        }
+        // A collapsed remote share reopens from the sharer's tile.
+        let watching = self.call.as_ref().and_then(|call| call.watching);
+        if media.sharing_screen && !is_me && watching != Some(who) {
+            tile = tile.push(
+                button(text("watch").size(10).font(MONO))
+                    .style(theme::ghost)
+                    .padding([2, 10])
+                    .on_press(Msg::Watch(who)),
+            );
         }
         container(tile)
             .style(theme::call_tile)
@@ -1164,9 +1353,9 @@ impl Mikall {
             .into()
     }
 
-    fn media_chip(label: &str) -> Element<'_, Msg> {
+    fn media_chip(label: &str, style: fn(&iced::Theme) -> container::Style) -> Element<'_, Msg> {
         container(text(label).size(9).font(MONO))
-            .style(theme::chip_danger)
+            .style(style)
             .padding([2, 6])
             .into()
     }
