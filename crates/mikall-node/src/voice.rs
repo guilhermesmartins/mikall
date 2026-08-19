@@ -19,6 +19,10 @@ pub enum MediaAlert {
     /// The output device could not be opened — peers still hear us, we
     /// hear nobody.
     SpeakerUnavailable { call: CallId, detail: String },
+    /// The screen could not be captured (macOS Screen Recording
+    /// permission, most likely) — the share stays signaling-only, no
+    /// pixels leave this machine.
+    ScreenCaptureUnavailable { call: CallId, detail: String },
 }
 
 #[cfg(feature = "hardware-audio")]

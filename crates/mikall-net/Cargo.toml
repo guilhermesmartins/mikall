@@ -19,6 +19,7 @@ tracing = { workspace = true }
 serde = { workspace = true }
 ciborium = { workspace = true }
 blake3 = { workspace = true }
+libp2p-stream = { workspace = true }
 libp2p = { workspace = true, features = [
     "tokio",
     "tcp",

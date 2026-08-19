@@ -48,6 +48,7 @@ pub struct CallService {
     bus: EventBus,
     calls: Arc<RwLock<BTreeMap<CallId, Call>>>,
     media_taps: Arc<RwLock<BTreeMap<CallId, MediaTap>>>,
+    video_taps: Arc<RwLock<BTreeMap<CallId, MediaTap>>>,
     call_keys: Arc<RwLock<BTreeMap<CallId, [u8; 32]>>>,
 }
 
@@ -71,6 +72,7 @@ impl CallService {
             bus,
             calls: Arc::new(RwLock::new(BTreeMap::new())),
             media_taps: Arc::new(RwLock::new(BTreeMap::new())),
+            video_taps: Arc::new(RwLock::new(BTreeMap::new())),
             call_keys: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
@@ -203,6 +205,7 @@ impl CallService {
         };
         self.bus.publish_domain(event);
         self.media_taps.write().await.remove(&id);
+        self.video_taps.write().await.remove(&id);
         for peer in peers {
             let _ = self.signaling.send(peer, id, CallAction::HangUp).await;
         }
@@ -312,13 +315,15 @@ impl CallService {
                                 }
                             },
                         }
-                        // The media tap lives as long as the call does — a
-                        // single participant leaving must not silence it.
+                        // The media taps live as long as the call does — a
+                        // single participant leaving must not silence them.
                         if matches!(call.phase(), CallPhase::Ended { .. }) {
                             self.media_taps.write().await.remove(&id);
+                            self.video_taps.write().await.remove(&id);
                         }
                     } else {
                         self.media_taps.write().await.remove(&id);
+                        self.video_taps.write().await.remove(&id);
                     }
                 }
                 CallAction::ScreenShare { active } => {
@@ -353,6 +358,24 @@ impl CallService {
     /// Inbound sealed media frame from the router.
     pub async fn receive_media(&self, from: IdentityId, id: CallId, sealed_frame: Vec<u8>) {
         let tap = self.media_taps.read().await.get(&id).cloned();
+        if let Some(tap) = tap {
+            let _ = tap.try_send((from, sealed_frame));
+        }
+    }
+
+    /// The video engine registers here to receive this call's inbound
+    /// sealed video frames — a tap of its own, keyed (sender, kind =
+    /// video) by construction, so interleaved voice never crosses lanes.
+    pub async fn video_tap(&self, id: CallId) -> mpsc::Receiver<(IdentityId, Vec<u8>)> {
+        let (tx, rx) = mpsc::channel(64);
+        self.video_taps.write().await.insert(id, tx);
+        rx
+    }
+
+    /// Inbound sealed video frame from the router. `try_send`: a stalled
+    /// consumer drops frames rather than back-pressuring the network task.
+    pub async fn receive_video(&self, from: IdentityId, id: CallId, sealed_frame: Vec<u8>) {
+        let tap = self.video_taps.read().await.get(&id).cloned();
         if let Some(tap) = tap {
             let _ = tap.try_send((from, sealed_frame));
         }

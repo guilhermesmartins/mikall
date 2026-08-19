@@ -39,6 +39,7 @@ proptest = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 libp2p = { version = "0.56", default-features = false }
+libp2p-stream = "0.4.0-alpha"
 blake3 = "1.8"
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 rand = "0.8"
@@ -52,6 +53,8 @@ iced = { version = "0.13", default-features = false }
 chacha20poly1305 = "0.10"
 audiopus = "0.2"
 cpal = "0.15"
+openh264 = "0.9"
+scap = "0.1.0-beta.1"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

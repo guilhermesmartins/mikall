@@ -8,7 +8,7 @@ use std::sync::Arc;
 use mikall_app::events::{AppEvent, EventBus};
 use mikall_app::ports::{
     BlobStore, CallSignaling, ChatTransport, ChunkHasher, Clock, Directory, FileTransport, IdGen,
-    KeyStore, MediaTransport, MessageStore, ProfileStore,
+    KeyStore, MediaStreamTransport, MediaTransport, MessageStore, ProfileStore,
 };
 use mikall_app::services::{
     CallService, ChatService, DmService, IdentityService, InboundRouter, PresenceService, Profile,
@@ -18,7 +18,9 @@ use mikall_crypto::{Blake3ChunkHasher, CryptoIdGen, FileKeyStore, LocalKeys, Sys
 use mikall_net::{NetConfig, NetControl, NetStack};
 use mikall_store::{FsBlobStore, RedbStore};
 
+pub mod video;
 pub mod voice;
+pub use video::RemoteVideoFrame;
 pub use voice::MediaAlert;
 
 #[derive(Debug, thiserror::Error)]
@@ -41,6 +43,10 @@ pub struct NodeConfig {
     /// it off so no test ever opens a device or races the pipelines they
     /// drive by hand.
     pub call_audio: bool,
+    /// Run the video engine (real screen capture and decode for shares).
+    /// Only effective on `hardware-video` builds; same test discipline as
+    /// `call_audio`.
+    pub call_video: bool,
 }
 
 impl NodeConfig {
@@ -49,6 +55,7 @@ impl NodeConfig {
             data_dir,
             net: NetConfig::default(),
             call_audio: true,
+            call_video: true,
         }
     }
 }
@@ -67,10 +74,17 @@ pub struct NodeHandle {
     pub net: NetControl,
     /// Sends sealed media frames to call peers (used by the media engine).
     pub media: Arc<dyn MediaTransport>,
-    /// Device trouble from the voice engine (mic denied, no speaker) —
-    /// honest, non-fatal, for frontends to surface. Only the
-    /// `hardware-audio` build ever sends; subscribing is always safe.
+    /// Opens unidirectional media streams to call peers (used by the
+    /// video engine; voice migrates here later).
+    pub media_streams: Arc<dyn MediaStreamTransport>,
+    /// Device trouble from the media engines (mic denied, no speaker,
+    /// screen recording refused) — honest, non-fatal, for frontends to
+    /// surface. Only hardware builds ever send; subscribing is always
+    /// safe.
     media_alerts: tokio::sync::broadcast::Sender<MediaAlert>,
+    /// Decoded frames of remote screen shares. Only the `hardware-video`
+    /// build ever sends; subscribing is always safe.
+    video_frames: tokio::sync::broadcast::Sender<RemoteVideoFrame>,
     /// Background tasks owned by this node: the swarm loop, the boot
     /// redial of remembered peers and (with `hardware-audio`) the voice
     /// engine. All aborted on shutdown.
@@ -88,10 +102,17 @@ impl NodeHandle {
         self.bus.subscribe()
     }
 
-    /// Voice-device trouble (mic denied, no output device). Empty forever
-    /// on builds without `hardware-audio`.
+    /// Media-device trouble (mic denied, no output device, screen
+    /// recording refused). Empty forever on builds without the hardware
+    /// features.
     pub fn subscribe_media_alerts(&self) -> tokio::sync::broadcast::Receiver<MediaAlert> {
         self.media_alerts.subscribe()
+    }
+
+    /// Decoded pictures of remote screen shares, ready to render. Empty
+    /// forever on builds without `hardware-video`.
+    pub fn subscribe_video_frames(&self) -> tokio::sync::broadcast::Receiver<RemoteVideoFrame> {
+        self.video_frames.subscribe()
     }
 
     /// Stop the background tasks and release the node's resources (key
@@ -133,6 +154,7 @@ pub async fn start(config: NodeConfig) -> Result<NodeHandle, NodeError> {
     let files: Arc<dyn FileTransport> = net.files.clone();
     let call_signaling: Arc<dyn CallSignaling> = net.call_signaling.clone();
     let media: Arc<dyn MediaTransport> = net.media.clone();
+    let media_streams: Arc<dyn MediaStreamTransport> = net.media_streams.clone();
     let directory: Arc<dyn Directory> = net.directory.clone();
     let control = net.control.clone();
 
@@ -196,7 +218,7 @@ pub async fn start(config: NodeConfig) -> Result<NodeHandle, NodeError> {
         Arc::clone(&transfer),
         Arc::clone(&calls),
     ));
-    let net_task = net.start(router, blobs);
+    let net_tasks = net.start(router, blobs);
     // Redial remembered peers in the background: with mDNS often blocked
     // (macOS local-network permission), this is what makes connecting
     // automatic from the second boot on — for every frontend, with zero
@@ -207,8 +229,10 @@ pub async fn start(config: NodeConfig) -> Result<NodeHandle, NodeError> {
     ));
 
     let (media_alerts, _) = tokio::sync::broadcast::channel(16);
+    let (video_frames, _) = tokio::sync::broadcast::channel::<RemoteVideoFrame>(8);
     #[allow(unused_mut)]
-    let mut tasks = vec![net_task, redial_task];
+    let mut tasks = net_tasks;
+    tasks.push(redial_task);
     // Real call audio (mic → Opus → sealed frames, and back out the
     // speakers) for every frontend of this node — the GUI enables the
     // feature by default; `--no-default-features` builds stay device-free.
@@ -222,6 +246,20 @@ pub async fn start(config: NodeConfig) -> Result<NodeHandle, NodeError> {
             media_alerts.clone(),
         ));
     }
+    // Real screen-share video (capture → H.264 → sealed frames over
+    // per-viewer streams, and back into the frame feed) — same feature
+    // discipline as audio.
+    #[cfg(feature = "hardware-video")]
+    if config.call_video {
+        tasks.push(video::spawn_video_engine(
+            Arc::clone(&identity),
+            Arc::clone(&calls),
+            Arc::clone(&media_streams),
+            bus.clone(),
+            media_alerts.clone(),
+            video_frames.clone(),
+        ));
+    }
 
     Ok(NodeHandle {
         identity,
@@ -233,7 +271,9 @@ pub async fn start(config: NodeConfig) -> Result<NodeHandle, NodeError> {
         bus,
         net: control,
         media,
+        media_streams,
         media_alerts,
+        video_frames,
         tasks: Arc::new(std::sync::Mutex::new(tasks)),
     })
 }

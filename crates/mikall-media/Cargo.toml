@@ -13,6 +13,10 @@ default = []
 ## pipeline itself (engine, frames, jitter, PCM helpers) never needs the
 ## feature — only the device and codec adapters live behind it.
 hardware-audio = ["dep:audiopus", "dep:cpal"]
+## Screen capture via scap (ScreenCaptureKit on macOS) plus H.264 coding
+## via the bundled OpenH264. Same discipline: the video pipeline itself
+## never needs the feature — only the capture and codec adapters do.
+hardware-video = ["dep:scap", "dep:openh264"]
 
 [dependencies]
 mikall-domain = { workspace = true }
@@ -23,6 +27,8 @@ tracing = { workspace = true }
 chacha20poly1305 = { workspace = true }
 audiopus = { workspace = true, optional = true }
 cpal = { workspace = true, optional = true }
+openh264 = { workspace = true, optional = true }
+scap = { workspace = true, optional = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }

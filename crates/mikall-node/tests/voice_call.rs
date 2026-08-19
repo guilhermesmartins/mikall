@@ -29,6 +29,7 @@ fn test_config(dir: &Path) -> NodeConfig {
         },
         // Tests drive media pipelines by hand; never open real devices.
         call_audio: false,
+        call_video: false,
     }
 }
 

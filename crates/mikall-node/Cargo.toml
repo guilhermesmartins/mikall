@@ -12,6 +12,9 @@ rust-version.workspace = true
 ## Opus via mikall-media. Off by default so headless/CI builds never
 ## touch audio devices; the GUI turns it on through its default feature.
 hardware-audio = ["mikall-media/hardware-audio"]
+## Real screen-share video: scap capture and OpenH264 via mikall-media.
+## Same default-off discipline as hardware-audio.
+hardware-video = ["mikall-media/hardware-video"]
 
 [dependencies]
 mikall-domain = { workspace = true }

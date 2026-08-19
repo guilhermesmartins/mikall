@@ -11,6 +11,15 @@ use chacha20poly1305::ChaCha20Poly1305;
 
 pub const HEADER_LEN: usize = 18;
 
+/// Header flag bit 0: last frame of a video picture (every M16 video frame
+/// is one whole picture, so the bit is always set on video).
+pub const FLAG_END_OF_PICTURE: u8 = 0b0000_0001;
+/// Header flag bit 1: this video frame is a keyframe (IDR) — decodable
+/// with no prior state. In the AAD, so a forwarder can trust it without
+/// decrypting: exactly what the keyframe cache of the forwarding-tree
+/// milestone needs.
+pub const FLAG_KEYFRAME: u8 = 0b0000_0010;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaKind {
     Audio,

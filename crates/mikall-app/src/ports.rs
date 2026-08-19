@@ -105,6 +105,10 @@ pub trait InboundHandler: Send + Sync {
     /// Sealed media frame for a call. Authenticity comes from the per-call
     /// AEAD key, not an envelope signature.
     async fn on_media_frame(&self, from: IdentityId, call: CallId, sealed_frame: Vec<u8>);
+    /// Sealed video frame for a call, arriving on a unidirectional media
+    /// stream. Same trust model as [`InboundHandler::on_media_frame`]; a
+    /// separate method because video demuxes to its own per-call tap.
+    async fn on_video_frame(&self, from: IdentityId, call: CallId, sealed_frame: Vec<u8>);
 }
 
 /// A channel's discovery record: enough for a stranger to join.
@@ -401,6 +405,36 @@ pub trait MediaTransport: Send + Sync {
         call: CallId,
         sealed_frame: Vec<u8>,
     ) -> Result<(), TransportError>;
+}
+
+/// Which media a unidirectional stream carries. Video rides streams as of
+/// M16; voice still travels [`MediaTransport`] and moves here later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaStreamKind {
+    Audio,
+    Video,
+}
+
+/// One live unidirectional media lane toward a peer: sealed frames go in,
+/// nothing comes back — real-time media wants no per-frame acks. Closing
+/// is dropping.
+#[async_trait]
+pub trait MediaSendStream: Send {
+    async fn send(&mut self, sealed_frame: &[u8]) -> Result<(), TransportError>;
+}
+
+/// Opens unidirectional media streams to call peers (one QUIC/yamux
+/// substream per (sender, viewer, kind) in production). The media engine
+/// runs one lane per viewer with its own queue, so a slow viewer can never
+/// head-of-line-block the others or the signaling path.
+#[async_trait]
+pub trait MediaStreamTransport: Send + Sync {
+    async fn open_stream(
+        &self,
+        to: IdentityId,
+        call: CallId,
+        kind: MediaStreamKind,
+    ) -> Result<Box<dyn MediaSendStream>, TransportError>;
 }
 
 /// BLAKE3 chunk hashing (crypto adapter in production).

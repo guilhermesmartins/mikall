@@ -8,17 +8,21 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-## `cargo run -p mikall-ui` hears and is heard out of the box. Build with
-## `--no-default-features` for a device-free binary (CI, headless).
-default = ["hardware-audio"]
+## `cargo run -p mikall-ui` hears, is heard, and shares real pixels out of
+## the box. Build with `--no-default-features` for a device-free binary
+## (CI, headless).
+default = ["hardware-audio", "hardware-video"]
 hardware-audio = ["mikall-node/hardware-audio"]
+hardware-video = ["mikall-node/hardware-video"]
 
 [dependencies]
 mikall-domain = { workspace = true }
 mikall-app = { workspace = true }
 mikall-node = { workspace = true }
 mikall-irc = { workspace = true }
-iced = { workspace = true, features = ["tokio", "wgpu", "tiny-skia", "web-colors", "auto-detect-theme"] }
+## `image` is always on: remote share frames render through it, and a
+## build without hardware-video simply never receives any.
+iced = { workspace = true, features = ["tokio", "wgpu", "tiny-skia", "web-colors", "auto-detect-theme", "image"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros"] }
 futures = { workspace = true }
 tracing = { workspace = true }

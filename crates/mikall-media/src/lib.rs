@@ -11,16 +11,32 @@
 //!   deterministic, tested without hardware.
 //! - [`opus`] / [`hardware`] (feature `hardware-audio`): the Opus codec
 //!   adapter and the cpal microphone/speaker adapters over the same ports.
+//! - [`video`]: the screen-share pipeline — static-frame gate, one
+//!   encode + one seal per frame, per-viewer latest-run-wins lanes over
+//!   unidirectional media streams ([`VideoFanout`](video::VideoFanout) is
+//!   the fan-out seam the forwarding tree will replace), and the ordered
+//!   per-sender receive path. Pure and fake-codec-testable.
+//! - [`capture`] / [`codec_h264`] (feature `hardware-video`): the scap
+//!   screen-capture adapter and the OpenH264 encoder/decoder over the
+//!   [`video`] ports.
 //!
 //! Group calls are a full mesh (domain-capped at 8): each participant runs
-//! one sender toward every peer and one receiver per call.
+//! one sender toward every peer and one receiver per call. Video is
+//! different by design (docs/streaming.md): one encode, per-viewer lanes,
+//! stale frames dropped in whole runs.
 
 pub mod engine;
 pub mod frame;
 pub mod jitter;
 pub mod pcm;
+pub mod video;
 
 #[cfg(feature = "hardware-audio")]
 pub mod hardware;
 #[cfg(feature = "hardware-audio")]
 pub mod opus;
+
+#[cfg(feature = "hardware-video")]
+pub mod capture;
+#[cfg(feature = "hardware-video")]
+pub mod codec_h264;

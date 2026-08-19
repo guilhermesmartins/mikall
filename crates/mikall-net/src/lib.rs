@@ -26,7 +26,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use mikall_app::ports::{
     BlobStore, CallAction, CallSignaling, ChannelRecord, ChannelSignal, ChatTransport, Directory,
-    DirectoryError, FileTransport, InboundHandler, MediaTransport, TransportError, WireMessage,
+    DirectoryError, FileTransport, InboundHandler, MediaSendStream, MediaStreamKind,
+    MediaStreamTransport, MediaTransport, TransportError, WireMessage,
 };
 use mikall_crypto::LocalKeys;
 use mikall_domain::calls::CallId;
@@ -139,7 +140,20 @@ struct Behaviour {
     dm: request_response::cbor::Behaviour<SignedEnvelope, DmAck>,
     blob: request_response::cbor::Behaviour<BlobRequest, BlobResponse>,
     media: request_response::cbor::Behaviour<MediaPacket, MediaAck>,
+    /// Unidirectional media streams (video today; voice migrates later).
+    /// Opened and accepted through a [`libp2p_stream::Control`] entirely
+    /// outside the swarm command loop, so media can never head-of-line
+    /// block signaling — and vice versa.
+    media_stream: libp2p_stream::Behaviour,
 }
+
+/// The unidirectional media-stream protocol: a 17-byte stream header
+/// (call id ‖ kind), then length-prefixed sealed frames, no acks ever.
+const MEDIA_STREAM_PROTOCOL: StreamProtocol = StreamProtocol::new("/mikall/media-stream/1");
+
+/// Per-frame ceiling on the stream (a 1280-wide screen keyframe is a few
+/// hundred KB; anything near this is hostile or corrupt).
+const MAX_MEDIA_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct NetConfig {
@@ -420,6 +434,133 @@ impl MediaTransport for NetMediaTransport {
     }
 }
 
+/// `MediaStreamTransport` implementation: one unidirectional libp2p
+/// substream per (viewer, kind), spoken directly through the stream
+/// behaviour's control — the global command channel never carries a
+/// video frame.
+pub struct NetMediaStreams {
+    control: libp2p_stream::Control,
+}
+
+impl std::fmt::Debug for NetMediaStreams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetMediaStreams").finish_non_exhaustive()
+    }
+}
+
+/// An open outbound media stream. Dropping it closes the substream.
+struct NetMediaSendStream {
+    stream: libp2p::Stream,
+}
+
+#[async_trait]
+impl MediaSendStream for NetMediaSendStream {
+    async fn send(&mut self, sealed_frame: &[u8]) -> Result<(), TransportError> {
+        use futures::AsyncWriteExt as _;
+        if sealed_frame.len() > MAX_MEDIA_FRAME_BYTES {
+            return Err(TransportError::Other("media frame too large".into()));
+        }
+        let len = sealed_frame.len() as u32;
+        self.stream
+            .write_all(&len.to_be_bytes())
+            .await
+            .map_err(|e| TransportError::Other(e.to_string()))?;
+        self.stream
+            .write_all(sealed_frame)
+            .await
+            .map_err(|e| TransportError::Other(e.to_string()))?;
+        self.stream
+            .flush()
+            .await
+            .map_err(|e| TransportError::Other(e.to_string()))?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl MediaStreamTransport for NetMediaStreams {
+    async fn open_stream(
+        &self,
+        to: IdentityId,
+        call: CallId,
+        kind: MediaStreamKind,
+    ) -> Result<Box<dyn MediaSendStream>, TransportError> {
+        use futures::AsyncWriteExt as _;
+        let peer = peer_id_of(&to)
+            .ok_or_else(|| TransportError::Other("recipient identity is not a valid key".into()))?;
+        let mut control = self.control.clone();
+        let mut stream = control
+            .open_stream(peer, MEDIA_STREAM_PROTOCOL)
+            .await
+            .map_err(|e| TransportError::Other(e.to_string()))?;
+        let mut header = [0u8; 17];
+        header[..16].copy_from_slice(call.as_bytes());
+        header[16] = match kind {
+            MediaStreamKind::Audio => 0,
+            MediaStreamKind::Video => 1,
+        };
+        stream
+            .write_all(&header)
+            .await
+            .map_err(|e| TransportError::Other(e.to_string()))?;
+        Ok(Box::new(NetMediaSendStream { stream }))
+    }
+}
+
+/// Accept inbound media streams and pump their frames to the handler.
+/// One task per stream; a malformed or oversized frame ends that stream
+/// only.
+async fn run_media_stream_acceptor(
+    mut incoming: libp2p_stream::IncomingStreams,
+    handler: Arc<dyn InboundHandler>,
+) {
+    while let Some((peer, stream)) = incoming.next().await {
+        let handler = Arc::clone(&handler);
+        tokio::spawn(read_media_stream(peer, stream, handler));
+    }
+}
+
+async fn read_media_stream(
+    peer: PeerId,
+    mut stream: libp2p::Stream,
+    handler: Arc<dyn InboundHandler>,
+) {
+    use futures::AsyncReadExt as _;
+    // The sender is authenticated by the transport (PeerId ↔ identity);
+    // frame authenticity is the per-call AEAD, exactly as on the old path.
+    let Some(from) = identity_of_peer(&peer) else {
+        return;
+    };
+    let mut header = [0u8; 17];
+    if stream.read_exact(&mut header).await.is_err() {
+        return;
+    }
+    let Ok(call_bytes) = <[u8; 16]>::try_from(&header[..16]) else {
+        return;
+    };
+    let call = CallId::from_bytes(call_bytes);
+    let kind = header[16];
+    let mut len_buf = [0u8; 4];
+    loop {
+        if stream.read_exact(&mut len_buf).await.is_err() {
+            break;
+        }
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len == 0 || len > MAX_MEDIA_FRAME_BYTES {
+            break;
+        }
+        let mut frame = vec![0u8; len];
+        if stream.read_exact(&mut frame).await.is_err() {
+            break;
+        }
+        match kind {
+            0 => handler.on_media_frame(from, call, frame).await,
+            1 => handler.on_video_frame(from, call, frame).await,
+            _ => break,
+        }
+    }
+}
+
 /// `Directory` implementation over Kademlia records.
 pub struct NetDirectory {
     tx: CommandSender,
@@ -473,8 +614,10 @@ pub struct NetStack {
     pub files: Arc<NetFileTransport>,
     pub call_signaling: Arc<NetCallSignaling>,
     pub media: Arc<NetMediaTransport>,
+    pub media_streams: Arc<NetMediaStreams>,
     pub control: NetControl,
     driver: NetDriver,
+    incoming_media_streams: libp2p_stream::IncomingStreams,
 }
 
 impl std::fmt::Debug for NetStack {
@@ -576,6 +719,7 @@ impl NetStack {
                     dm,
                     blob,
                     media,
+                    media_stream: libp2p_stream::Behaviour::new(),
                 })
             })
             .map_err(|e| NetError::Build(e.to_string()))?
@@ -592,12 +736,23 @@ impl NetStack {
         let sender = CommandSender(cmd_tx);
         let local_peer_id = *swarm.local_peer_id();
 
+        // The stream control lives outside the swarm task: media senders
+        // open substreams and the acceptor reads them without a single
+        // command-channel round trip.
+        let mut stream_control = swarm.behaviour().media_stream.new_control();
+        let incoming_media_streams = stream_control
+            .accept(MEDIA_STREAM_PROTOCOL)
+            .map_err(|e| NetError::Build(e.to_string()))?;
+
         Ok(NetStack {
             transport: Arc::new(NetTransport { tx: sender.clone() }),
             directory: Arc::new(NetDirectory { tx: sender.clone() }),
             files: Arc::new(NetFileTransport { tx: sender.clone() }),
             call_signaling: Arc::new(NetCallSignaling { tx: sender.clone() }),
             media: Arc::new(NetMediaTransport { tx: sender.clone() }),
+            media_streams: Arc::new(NetMediaStreams {
+                control: stream_control,
+            }),
             control: NetControl {
                 tx: sender,
                 local_peer_id,
@@ -607,18 +762,27 @@ impl NetStack {
                 cmd_rx,
                 keys,
             },
+            incoming_media_streams,
         })
     }
 
     /// Spawn the swarm event loop, delivering verified inbound traffic to
-    /// `handler` and serving blob-chunk requests from `blobs`.
+    /// `handler` and serving blob-chunk requests from `blobs`; and the
+    /// media-stream acceptor beside it.
     pub fn start(
         self,
         handler: Arc<dyn InboundHandler>,
         blobs: Arc<dyn BlobStore>,
-    ) -> tokio::task::JoinHandle<()> {
-        let NetStack { driver, .. } = self;
-        tokio::spawn(driver.run(handler, blobs))
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        let NetStack {
+            driver,
+            incoming_media_streams,
+            ..
+        } = self;
+        vec![
+            tokio::spawn(driver.run(Arc::clone(&handler), blobs)),
+            tokio::spawn(run_media_stream_acceptor(incoming_media_streams, handler)),
+        ]
     }
 }
 

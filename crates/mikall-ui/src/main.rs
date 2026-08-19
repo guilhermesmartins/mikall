@@ -28,7 +28,7 @@ use mikall_domain::messaging::{ChannelName, MessagingEvent, Nickname, Role};
 use mikall_domain::presence::PresenceState;
 use mikall_domain::shared::IdentityId;
 use mikall_domain::DomainEvent;
-use mikall_node::{start, MediaAlert, NodeConfig, NodeHandle};
+use mikall_node::{start, MediaAlert, NodeConfig, NodeHandle, RemoteVideoFrame};
 
 const MONO: Font = Font::MONOSPACE;
 const MONO_BOLD: Font = Font {
@@ -135,6 +135,17 @@ struct CallUi {
     /// snapshot, so it can never point at someone the aggregate says
     /// stopped sharing (or at ourselves).
     watching: Option<IdentityId>,
+    /// Latest decoded picture per remote sharer of *this* call, ready for
+    /// the viewer pane. Entries leave when the share (or the call) ends.
+    frames: HashMap<IdentityId, ShareFrame>,
+}
+
+/// One renderable share picture.
+#[derive(Debug)]
+struct ShareFrame {
+    handle: iced::widget::image::Handle,
+    width: u32,
+    height: u32,
 }
 
 /// The abortable accept-loop of a running gateway. `mikall_irc::serve`
@@ -246,8 +257,11 @@ enum Msg {
     /// Toggle our mic (true = mute). Real: the media engine sends silence
     /// while muted, and the button renders from the aggregate's state.
     ToggleMute(CallId, bool),
-    /// Voice-device trouble from the node (mic denied, no output device).
+    /// Media-device trouble from the node (mic denied, no output device,
+    /// screen recording refused).
     MediaTrouble(MediaAlert),
+    /// A decoded frame of a remote screen share arrived.
+    VideoFrame(RemoteVideoFrame),
     /// Expand the viewer pane for a remote sharer (local view only).
     Watch(IdentityId),
     /// Collapse the viewer back to tiles (local view only — the sharer
@@ -570,6 +584,7 @@ impl Mikall {
             id,
             snapshot: None,
             watching: None,
+            frames: HashMap::new(),
         });
         self.refresh_call(id)
     }
@@ -1086,6 +1101,7 @@ impl Mikall {
                     id,
                     snapshot: None,
                     watching: None,
+                    frames: HashMap::new(),
                 });
                 self.refresh_call(id)
             }
@@ -1187,8 +1203,39 @@ impl Mikall {
                              you cannot hear them."
                         ),
                     ),
+                    MediaAlert::ScreenCaptureUnavailable { detail, .. } => (
+                        "SCREEN",
+                        format!(
+                            "screen recording permission needed — {detail}. The share is \
+                             signaled but no pixels leave this machine. On macOS: System \
+                             Settings → Privacy & Security → Screen Recording, then toggle \
+                             the share again."
+                        ),
+                    ),
                 };
                 self.alarm = Some(Alarm::Danger { title, body });
+                Task::none()
+            }
+            Msg::VideoFrame(frame) => {
+                // Only pictures of the call on the surface, and never our
+                // own (the sharer has no self-viewer).
+                let me = self.me();
+                if let Some(call) = &mut self.call {
+                    if call.id == frame.call && Some(frame.from) != me {
+                        call.frames.insert(
+                            frame.from,
+                            ShareFrame {
+                                handle: iced::widget::image::Handle::from_rgba(
+                                    frame.width,
+                                    frame.height,
+                                    frame.rgba.as_ref().clone(),
+                                ),
+                                width: frame.width,
+                                height: frame.height,
+                            },
+                        );
+                    }
+                }
                 Task::none()
             }
             Msg::Watch(who) => {
@@ -1366,6 +1413,7 @@ impl Mikall {
                     id: *call,
                     snapshot: None,
                     watching: None,
+                    frames: HashMap::new(),
                 });
                 return self.refresh_call(*call);
             }
@@ -1379,10 +1427,16 @@ impl Mikall {
                 {
                     current.watching = Some(*who);
                 }
-                CallEvent::ScreenShareStopped { call, who }
-                    if *call == current.id && current.watching == Some(*who) =>
-                {
-                    current.watching = None;
+                CallEvent::ScreenShareStopped { call, who } if *call == current.id => {
+                    // Their pictures leave with the share — a stale frame
+                    // must never pose as a live one.
+                    current.frames.remove(who);
+                    if current.watching == Some(*who) {
+                        current.watching = None;
+                    }
+                }
+                CallEvent::CallEnded { call, .. } if *call == current.id => {
+                    current.frames.clear();
                 }
                 _ => {}
             }
@@ -1430,7 +1484,21 @@ impl Mikall {
                 }
             }),
         );
-        let mut subs = vec![events, alerts];
+        let frames = Subscription::run_with_id(
+            "mikall-video-frames",
+            futures::stream::unfold(node.subscribe_video_frames(), |mut rx| async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(frame) => return Some((Msg::VideoFrame(frame), rx)),
+                        // Lagging is by design: stale share pictures are
+                        // dropped, the next fresh one wins.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                    }
+                }
+            }),
+        );
+        let mut subs = vec![events, alerts, frames];
         if self.call_is_ringing() {
             // The pulse only ticks while something actually rings.
             subs.push(iced::time::every(Duration::from_millis(700)).map(|_| Msg::RingPulse));
@@ -1807,17 +1875,17 @@ impl Mikall {
         }
         if i_am_sharing {
             // Our own share never gets a self-viewer — just the plain
-            // state, said honestly (§5): the share is real signaling, but
-            // nothing captures pixels yet.
-            body = body.push(
-                container(
-                    text("you are sharing your screen — signaled to peers, no pixels captured yet")
-                        .size(10)
-                        .font(MONO)
-                        .color(theme::TEAL),
-                )
-                .center_x(Fill),
-            );
+            // state, said honestly (§5). What the state *is* depends on
+            // the build: hardware-video captures and sends real pixels;
+            // without it the share is signaling only.
+            let line = if cfg!(feature = "hardware-video") {
+                "you are sharing your screen — capturing and sending to peers"
+            } else {
+                "you are sharing your screen — signaled to peers, no pixels \
+                 (built without hardware-video)"
+            };
+            body = body
+                .push(container(text(line).size(10).font(MONO).color(theme::TEAL)).center_x(Fill));
         }
         body = body.push(container(controls).center_x(Fill));
 
@@ -1828,27 +1896,28 @@ impl Mikall {
             .into()
     }
 
-    /// Brief §3.3: when someone shares, a viewer pane opens — a 16:9 area
-    /// with the sharer's nick and "stop watching". Screen-share *signaling*
-    /// is shipped; no decodable video reaches this process yet, so the
-    /// stage renders the honest placeholder instead of a fake image.
+    /// Brief §3.3: when someone shares, a viewer pane opens — the live
+    /// picture with the sharer's nick and "stop watching". Until the
+    /// first frame decodes (or when this build cannot decode), the stage
+    /// renders an honest placeholder instead of a fake image.
     fn view_share_viewer(&self, peer: IdentityId) -> Element<'_, Msg> {
         let (label, mono) = self.peer_label(peer);
         let name = if mono {
-            text(label).size(13).font(MONO)
+            text(label.clone()).size(13).font(MONO)
         } else {
-            text(label).size(13).font(SEMIBOLD)
+            text(label.clone()).size(13).font(SEMIBOLD)
         };
+        let frame = self.call.as_ref().and_then(|call| call.frames.get(&peer));
+        let live = frame
+            .map(|f| format!("is sharing their screen — live, {}×{}", f.width, f.height))
+            .unwrap_or_else(|| "is sharing their screen".to_owned());
         let header = row![
             text("SCREEN SHARE")
                 .size(11)
                 .font(MONO_BOLD)
                 .color(theme::TEAL),
             name,
-            text("is sharing their screen")
-                .size(12)
-                .color(theme::MUTED)
-                .width(Fill),
+            text(live).size(12).color(theme::MUTED).width(Fill),
             button(text("stop watching").size(11).font(MONO))
                 .style(theme::ghost)
                 .padding([3, 10])
@@ -1856,15 +1925,32 @@ impl Mikall {
         ]
         .spacing(10)
         .align_y(iced::Center);
-        let stage = container(
-            text("share signaled — video frames land with the hardware-media milestone")
+        let stage: Element<'_, Msg> = match frame {
+            // Real pixels: the decoded picture, letterboxed into the pane.
+            Some(share) => container(
+                iced::widget::image(share.handle.clone())
+                    .content_fit(iced::ContentFit::Contain)
+                    .width(Fill)
+                    .height(Fill),
+            )
+            .style(theme::share_stage)
+            .center_x(640)
+            .center_y(360)
+            .into(),
+            // No frame yet — waiting is a real state, say so plainly.
+            None => container(
+                text(format!(
+                    "{label} is sharing — waiting for the first video frame…"
+                ))
                 .size(11)
                 .font(MONO)
                 .color(theme::MUTED),
-        )
-        .style(theme::share_stage)
-        .center_x(480)
-        .center_y(270);
+            )
+            .style(theme::share_stage)
+            .center_x(640)
+            .center_y(360)
+            .into(),
+        };
         column![header, container(stage).center_x(Fill)]
             .spacing(8)
             .width(Fill)

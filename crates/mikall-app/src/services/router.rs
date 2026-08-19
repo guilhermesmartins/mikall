@@ -91,4 +91,8 @@ impl InboundHandler for InboundRouter {
     async fn on_media_frame(&self, from: IdentityId, call: CallId, sealed_frame: Vec<u8>) {
         self.calls.receive_media(from, call, sealed_frame).await;
     }
+
+    async fn on_video_frame(&self, from: IdentityId, call: CallId, sealed_frame: Vec<u8>) {
+        self.calls.receive_video(from, call, sealed_frame).await;
+    }
 }
