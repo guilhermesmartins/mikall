@@ -21,6 +21,7 @@
 //!   /decline-call <call>  decline an incoming call
 //!   /hangup <call>        hang up
 //!   /share <call> on|off  toggle screen-share flag
+//!   /mute <call> on|off   mute or unmute our mic in a call
 //!   /away [message]       set or clear away
 //!   /whoami               print identity + fingerprint
 //!   /addr                 print listen addresses
@@ -300,6 +301,16 @@ async fn handle_line(node: &NodeHandle, line: &str) -> anyhow::Result<bool> {
                 Some(id) => match node.calls.share_screen(id, state == "on").await {
                     Ok(()) => println!("screen share {state}"),
                     Err(e) => println!("share failed: {e}"),
+                },
+                None => println!("expected a 32-char hex call id"),
+            }
+        }
+        "/mute" => {
+            let (call, state) = rest.split_once(' ').unwrap_or((rest, "on"));
+            match parse_call(call) {
+                Some(id) => match node.calls.set_muted(id, state == "on").await {
+                    Ok(()) => println!("mic mute {state}"),
+                    Err(e) => println!("mute failed: {e}"),
                 },
                 None => println!("expected a 32-char hex call id"),
             }

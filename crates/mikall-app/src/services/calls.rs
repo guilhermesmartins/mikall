@@ -233,6 +233,32 @@ impl CallService {
         Ok(())
     }
 
+    /// Toggle our mic mute and tell the call. The enforcement is local —
+    /// the media engine sends silence while muted — this records the state
+    /// in the aggregate and advises every peer's roster.
+    pub async fn set_muted(&self, id: CallId, muted: bool) -> Result<(), CallServiceError> {
+        let me = self.identity.local_id();
+        let (event, peers) = {
+            let mut calls = self.calls.write().await;
+            let call = calls.get_mut(&id).ok_or(CallServiceError::UnknownCall)?;
+            let peers: Vec<IdentityId> = call
+                .roster()
+                .members()
+                .map(|(who, _)| who)
+                .filter(|who| *who != me)
+                .collect();
+            (call.set_mic_muted(me, muted)?, peers)
+        };
+        self.bus.publish_domain(event);
+        for peer in peers {
+            let _ = self
+                .signaling
+                .send(peer, id, CallAction::Mute { active: muted })
+                .await;
+        }
+        Ok(())
+    }
+
     /// Inbound signaling from the router (envelope already verified).
     pub async fn receive_signal(&self, from: IdentityId, id: CallId, action: CallAction) {
         let mut events: Vec<CallEvent> = Vec::new();
@@ -298,6 +324,13 @@ impl CallService {
                 CallAction::ScreenShare { active } => {
                     if let Some(call) = calls.get_mut(&id) {
                         if let Ok(event) = call.set_screen_sharing(from, active) {
+                            events.push(event);
+                        }
+                    }
+                }
+                CallAction::Mute { active } => {
+                    if let Some(call) = calls.get_mut(&id) {
+                        if let Ok(event) = call.set_mic_muted(from, active) {
                             events.push(event);
                         }
                     }

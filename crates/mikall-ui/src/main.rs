@@ -28,7 +28,7 @@ use mikall_domain::messaging::{ChannelName, MessagingEvent, Nickname, Role};
 use mikall_domain::presence::PresenceState;
 use mikall_domain::shared::IdentityId;
 use mikall_domain::DomainEvent;
-use mikall_node::{start, NodeConfig, NodeHandle};
+use mikall_node::{start, MediaAlert, NodeConfig, NodeHandle};
 
 const MONO: Font = Font::MONOSPACE;
 const MONO_BOLD: Font = Font {
@@ -243,6 +243,11 @@ enum Msg {
     CallInvite(CallId, IdentityId),
     /// Toggle our own screen share (true = start, false = stop).
     ShareScreen(CallId, bool),
+    /// Toggle our mic (true = mute). Real: the media engine sends silence
+    /// while muted, and the button renders from the aggregate's state.
+    ToggleMute(CallId, bool),
+    /// Voice-device trouble from the node (mic denied, no output device).
+    MediaTrouble(MediaAlert),
     /// Expand the viewer pane for a remote sharer (local view only).
     Watch(IdentityId),
     /// Collapse the viewer back to tiles (local view only — the sharer
@@ -608,6 +613,8 @@ impl Mikall {
             | CallEvent::ParticipantLeft { call, .. }
             | CallEvent::ScreenShareStarted { call, .. }
             | CallEvent::ScreenShareStopped { call, .. }
+            | CallEvent::MicMuted { call, .. }
+            | CallEvent::MicUnmuted { call, .. }
             | CallEvent::CallEnded { call, .. } => *call,
         }
     }
@@ -1147,6 +1154,43 @@ impl Mikall {
                     Msg::CallDone,
                 )
             }
+            Msg::ToggleMute(id, muted) => {
+                let Some(node) = self.node() else {
+                    return Task::none();
+                };
+                Task::perform(
+                    async move {
+                        node.calls
+                            .set_muted(id, muted)
+                            .await
+                            .map_err(|e| e.to_string())
+                    },
+                    Msg::CallDone,
+                )
+            }
+            Msg::MediaTrouble(alert) => {
+                // Honest, not fatal: the call carries on in whatever
+                // direction still works; the alarm says which one broke.
+                let (title, body) = match alert {
+                    MediaAlert::MicUnavailable { detail, .. } => (
+                        "MIC",
+                        format!(
+                            "mic unavailable — {detail}. The call continues receive-only \
+                             (peers cannot hear you). On macOS: System Settings → Privacy \
+                             & Security → Microphone."
+                        ),
+                    ),
+                    MediaAlert::SpeakerUnavailable { detail, .. } => (
+                        "AUDIO OUT",
+                        format!(
+                            "speaker unavailable — {detail}. Peers still hear you; \
+                             you cannot hear them."
+                        ),
+                    ),
+                };
+                self.alarm = Some(Alarm::Danger { title, body });
+                Task::none()
+            }
             Msg::Watch(who) => {
                 // Never watch ourselves — our own share has no viewer.
                 if Some(who) != self.me() {
@@ -1306,14 +1350,18 @@ impl Mikall {
         let me = self.me();
         if let CallEvent::CallOffered { call, by, .. } = &event {
             let incoming = Some(*by) != me;
-            if incoming && self.call.as_ref().map(|c| c.id) != Some(*call) {
+            if self.call.as_ref().map(|c| c.id) != Some(*call) {
                 if self.call_in_progress() {
                     // Gentle interruption only: one call surface at a time.
-                    if !self.call_backlog.contains(call) {
+                    if incoming && !self.call_backlog.contains(call) {
                         self.call_backlog.push(*call);
                     }
                     return Task::none();
                 }
+                // Incoming rings and calls this node started from *any*
+                // frontend (this GUI via `Msg::CallStarted`, mikalld, a
+                // future one) both surface here — the GUI always shows
+                // its node's calls.
                 self.call = Some(CallUi {
                     id: *call,
                     snapshot: None,
@@ -1370,7 +1418,19 @@ impl Mikall {
                 }
             }),
         );
-        let mut subs = vec![events];
+        let alerts = Subscription::run_with_id(
+            "mikall-media-alerts",
+            futures::stream::unfold(node.subscribe_media_alerts(), |mut rx| async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(alert) => return Some((Msg::MediaTrouble(alert), rx)),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                    }
+                }
+            }),
+        );
+        let mut subs = vec![events, alerts];
         if self.call_is_ringing() {
             // The pulse only ticks while something actually rings.
             subs.push(iced::time::every(Duration::from_millis(700)).map(|_| Msg::RingPulse));
@@ -1630,16 +1690,22 @@ impl Mikall {
     }
 
     /// Active call: participant tiles (max 8, rows of 4) + controls.
-    /// Mute/deafen toggles are absent on purpose: no use-case service
-    /// exposes them yet, and a control that does nothing would lie. The
-    /// share-screen toggle is real — it drives `CallService::share_screen`
-    /// and our own state renders from the snapshot, never a local bool.
+    /// The mic toggle is real as of M15: it drives `CallService::set_muted`,
+    /// the media engine sends silence while muted, and the button renders
+    /// from the aggregate's state — never a local bool. Deafen is still
+    /// absent on purpose: nothing implements it yet, and a control that
+    /// does nothing would lie. The share-screen toggle drives
+    /// `CallService::share_screen` the same way.
     fn view_call_active(&self, id: CallId, snapshot: &CallSnapshot) -> Element<'_, Msg> {
         let me = self.me();
         let i_am_sharing = snapshot
             .participants
             .iter()
             .any(|(who, media)| Some(*who) == me && media.sharing_screen);
+        let i_am_muted = snapshot
+            .participants
+            .iter()
+            .any(|(who, media)| Some(*who) == me && media.mic_muted);
         // The expanded viewer only ever shows a remote participant the
         // aggregate says is sharing right now (we never watch ourselves).
         let watching = self
@@ -1693,7 +1759,21 @@ impl Mikall {
                 .padding([6, 14])
                 .on_press(Msg::ShareScreen(id, true))
         };
+        // Real state, real switch: while muted the engine ships silence
+        // frames, so the red button always tells the truth.
+        let mute_toggle = if i_am_muted {
+            button(text("mic off — unmute").size(12).font(MONO))
+                .style(theme::danger_outline)
+                .padding([6, 14])
+                .on_press(Msg::ToggleMute(id, false))
+        } else {
+            button(text("mute mic").size(12).font(MONO))
+                .style(theme::ghost)
+                .padding([6, 14])
+                .on_press(Msg::ToggleMute(id, true))
+        };
         let controls = row![
+            mute_toggle,
             share_toggle,
             button(text("hang up").size(12).font(SEMIBOLD))
                 .style(theme::danger)

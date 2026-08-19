@@ -7,6 +7,12 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+## Real call audio for every frontend of this node: cpal mic/speaker and
+## Opus via mikall-media. Off by default so headless/CI builds never
+## touch audio devices; the GUI turns it on through its default feature.
+hardware-audio = ["mikall-media/hardware-audio"]
+
 [dependencies]
 mikall-domain = { workspace = true }
 mikall-app = { workspace = true }
@@ -14,6 +20,7 @@ mikall-crypto = { workspace = true }
 mikall-net = { workspace = true }
 mikall-store = { workspace = true }
 mikall-irc = { workspace = true }
+mikall-media = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "io-std", "io-util", "time", "signal"] }
@@ -23,7 +30,6 @@ libp2p = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
-mikall-media = { workspace = true }
 cucumber = { workspace = true }
 futures = { workspace = true }
 

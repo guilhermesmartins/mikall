@@ -18,6 +18,9 @@ use mikall_crypto::{Blake3ChunkHasher, CryptoIdGen, FileKeyStore, LocalKeys, Sys
 use mikall_net::{NetConfig, NetControl, NetStack};
 use mikall_store::{FsBlobStore, RedbStore};
 
+pub mod voice;
+pub use voice::MediaAlert;
+
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
     #[error(transparent)]
@@ -33,6 +36,11 @@ pub struct NodeConfig {
     /// Data directory: identity key + message database live here.
     pub data_dir: PathBuf,
     pub net: NetConfig,
+    /// Run the voice engine (real mic/speaker audio for active calls).
+    /// Only effective on `hardware-audio` builds; integration tests turn
+    /// it off so no test ever opens a device or races the pipelines they
+    /// drive by hand.
+    pub call_audio: bool,
 }
 
 impl NodeConfig {
@@ -40,6 +48,7 @@ impl NodeConfig {
         NodeConfig {
             data_dir,
             net: NetConfig::default(),
+            call_audio: true,
         }
     }
 }
@@ -58,8 +67,13 @@ pub struct NodeHandle {
     pub net: NetControl,
     /// Sends sealed media frames to call peers (used by the media engine).
     pub media: Arc<dyn MediaTransport>,
-    /// Background tasks owned by this node: the swarm loop and the boot
-    /// redial of remembered peers. All aborted on shutdown.
+    /// Device trouble from the voice engine (mic denied, no speaker) —
+    /// honest, non-fatal, for frontends to surface. Only the
+    /// `hardware-audio` build ever sends; subscribing is always safe.
+    media_alerts: tokio::sync::broadcast::Sender<MediaAlert>,
+    /// Background tasks owned by this node: the swarm loop, the boot
+    /// redial of remembered peers and (with `hardware-audio`) the voice
+    /// engine. All aborted on shutdown.
     tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
@@ -72,6 +86,12 @@ impl std::fmt::Debug for NodeHandle {
 impl NodeHandle {
     pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<AppEvent> {
         self.bus.subscribe()
+    }
+
+    /// Voice-device trouble (mic denied, no output device). Empty forever
+    /// on builds without `hardware-audio`.
+    pub fn subscribe_media_alerts(&self) -> tokio::sync::broadcast::Receiver<MediaAlert> {
+        self.media_alerts.subscribe()
     }
 
     /// Stop the background tasks and release the node's resources (key
@@ -186,6 +206,23 @@ pub async fn start(config: NodeConfig) -> Result<NodeHandle, NodeError> {
         control.clone(),
     ));
 
+    let (media_alerts, _) = tokio::sync::broadcast::channel(16);
+    #[allow(unused_mut)]
+    let mut tasks = vec![net_task, redial_task];
+    // Real call audio (mic → Opus → sealed frames, and back out the
+    // speakers) for every frontend of this node — the GUI enables the
+    // feature by default; `--no-default-features` builds stay device-free.
+    #[cfg(feature = "hardware-audio")]
+    if config.call_audio {
+        tasks.push(voice::spawn_voice_engine(
+            Arc::clone(&identity),
+            Arc::clone(&calls),
+            Arc::clone(&media),
+            bus.clone(),
+            media_alerts.clone(),
+        ));
+    }
+
     Ok(NodeHandle {
         identity,
         chat,
@@ -196,7 +233,8 @@ pub async fn start(config: NodeConfig) -> Result<NodeHandle, NodeError> {
         bus,
         net: control,
         media,
-        tasks: Arc::new(std::sync::Mutex::new(vec![net_task, redial_task])),
+        media_alerts,
+        tasks: Arc::new(std::sync::Mutex::new(tasks)),
     })
 }
 

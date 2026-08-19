@@ -86,6 +86,9 @@ pub enum CallActionDto {
     ScreenShare {
         active: bool,
     },
+    Mute {
+        active: bool,
+    },
 }
 
 fn call_action_dto(action: &CallAction) -> CallActionDto {
@@ -101,6 +104,7 @@ fn call_action_dto(action: &CallAction) -> CallActionDto {
         CallAction::Decline => CallActionDto::Decline,
         CallAction::HangUp => CallActionDto::HangUp,
         CallAction::ScreenShare { active } => CallActionDto::ScreenShare { active: *active },
+        CallAction::Mute { active } => CallActionDto::Mute { active: *active },
     }
 }
 
@@ -120,6 +124,7 @@ fn parse_call_action(dto: CallActionDto) -> Result<CallAction, WireError> {
         CallActionDto::Decline => CallAction::Decline,
         CallActionDto::HangUp => CallAction::HangUp,
         CallActionDto::ScreenShare { active } => CallAction::ScreenShare { active },
+        CallActionDto::Mute { active } => CallAction::Mute { active },
     })
 }
 

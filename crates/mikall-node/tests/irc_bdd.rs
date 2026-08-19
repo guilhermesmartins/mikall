@@ -34,6 +34,8 @@ fn node_config(dir: PathBuf) -> NodeConfig {
             listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
             enable_mdns: false,
         },
+        // Tests drive media pipelines by hand; never open real devices.
+        call_audio: false,
     }
 }
 

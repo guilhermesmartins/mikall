@@ -260,6 +260,14 @@ pub enum CallEvent {
         call: CallId,
         who: IdentityId,
     },
+    MicMuted {
+        call: CallId,
+        who: IdentityId,
+    },
+    MicUnmuted {
+        call: CallId,
+        who: IdentityId,
+    },
     CallEnded {
         call: CallId,
         reason: EndReason,
@@ -557,6 +565,24 @@ impl Call {
             }
         }
     }
+
+    /// A participant's mic mute state changed (their own choice — nobody
+    /// mutes anyone else in a serverless mesh).
+    pub fn set_mic_muted(&mut self, who: IdentityId, muted: bool) -> Result<CallEvent, CallError> {
+        match self.phase {
+            CallPhase::Active => {
+                self.roster.update_media(&who, |m| m.mic_muted = muted)?;
+                Ok(if muted {
+                    CallEvent::MicMuted { call: self.id, who }
+                } else {
+                    CallEvent::MicUnmuted { call: self.id, who }
+                })
+            }
+            CallPhase::Ringing { .. } | CallPhase::Connecting | CallPhase::Ended { .. } => {
+                Err(CallError::Ended)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -739,5 +765,28 @@ mod tests {
         call.connected().unwrap();
         let event = call.set_screen_sharing(id(1), true).unwrap();
         assert!(matches!(event, CallEvent::ScreenShareStarted { .. }));
+    }
+
+    #[test]
+    fn mic_mute_only_while_active_and_tracks_state() {
+        let (mut call, _) = Call::offer(CallId::from_bytes([1; 16]), id(1), vec![id(2)]);
+        assert_eq!(call.set_mic_muted(id(1), true), Err(CallError::Ended));
+        call.accept(id(2)).unwrap();
+        call.connected().unwrap();
+        let event = call.set_mic_muted(id(1), true).unwrap();
+        assert!(matches!(event, CallEvent::MicMuted { who, .. } if who == id(1)));
+        let muted = call
+            .roster()
+            .members()
+            .find(|(who, _)| *who == id(1))
+            .map(|(_, media)| media.mic_muted);
+        assert_eq!(muted, Some(true));
+        let event = call.set_mic_muted(id(1), false).unwrap();
+        assert!(matches!(event, CallEvent::MicUnmuted { who, .. } if who == id(1)));
+        // A stranger's mute is unrepresentable.
+        assert_eq!(
+            call.set_mic_muted(id(9), true),
+            Err(CallError::Roster(RosterError::NotPresent))
+        );
     }
 }

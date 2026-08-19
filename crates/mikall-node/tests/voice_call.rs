@@ -13,7 +13,8 @@ use mikall_app::events::AppEvent;
 use mikall_domain::calls::{CallEvent, CallPhase};
 use mikall_domain::DomainEvent;
 use mikall_media::engine::{
-    run_receiver, run_sender, AudioSource, CollectSink, PcmCodec, SineSource,
+    frames_from_source, run_receiver, run_sender, AudioSource, CollectSink, PcmCodec,
+    SenderControl, SineSource,
 };
 use mikall_media::frame::CallKey;
 use mikall_net::NetConfig;
@@ -26,6 +27,8 @@ fn test_config(dir: &Path) -> NodeConfig {
             listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
             enable_mdns: false,
         },
+        // Tests drive media pipelines by hand; never open real devices.
+        call_audio: false,
     }
 }
 
@@ -123,19 +126,20 @@ async fn call_signaling_and_sealed_voice_frames() {
     let receiver = tokio::spawn(async move {
         let key = CallKey::new(bob_key);
         let mut sink = CollectSink::default();
-        let stats = run_receiver(tap, &key, Box::new(PcmCodec), &mut sink, Some(10)).await;
+        let stats = run_receiver(tap, &key, || Box::new(PcmCodec), &mut sink, Some(10)).await;
         (stats, sink.samples)
     });
 
+    let control = SenderControl::new(vec![bob.identity.local_id()]);
+    let frames = frames_from_source(Box::new(SineSource::new(10)), None);
     let sent = run_sender(
         alice.media.clone(),
         call,
         &CallKey::new(alice_key),
         1,
-        &[bob.identity.local_id()],
-        Box::new(SineSource::new(10)),
+        control,
+        frames,
         Box::new(PcmCodec),
-        None,
     )
     .await;
     assert_eq!(sent, 10);

@@ -373,6 +373,11 @@ pub enum CallAction {
     ScreenShare {
         active: bool,
     },
+    /// The sender muted (or unmuted) their mic. Advisory roster state —
+    /// the muted party enforces it locally by sending only silence.
+    Mute {
+        active: bool,
+    },
 }
 
 /// Sends call signaling to a peer (signed direct envelopes in production).
