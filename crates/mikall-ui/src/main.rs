@@ -151,6 +151,58 @@ struct ShareFrame {
     via: Option<IdentityId>,
 }
 
+/// Per-second accounting of the render feed: how long each picture spent
+/// between the receiver's decode and this surface (feed_ms), and the
+/// glass-to-glass estimate from the sharer's wall-clock capture stamp
+/// (g2g_ms — exact when sharer and viewer share a wall clock, i.e. two
+/// instances on one machine; clock-skewed garbage across machines).
+#[derive(Debug)]
+struct VideoFeedStats {
+    window_start: std::time::Instant,
+    frames: u64,
+    feed_ms_sum: f64,
+    feed_ms_max: f64,
+    g2g_ms_sum: f64,
+    g2g_ms_max: f64,
+}
+
+impl Default for VideoFeedStats {
+    fn default() -> Self {
+        VideoFeedStats {
+            window_start: std::time::Instant::now(),
+            frames: 0,
+            feed_ms_sum: 0.0,
+            feed_ms_max: 0.0,
+            g2g_ms_sum: 0.0,
+            g2g_ms_max: 0.0,
+        }
+    }
+}
+
+impl VideoFeedStats {
+    fn observe(&mut self, frame: &RemoteVideoFrame) {
+        let feed_ms = frame.decoded_at.elapsed().as_secs_f64() * 1_000.0;
+        let g2g_ms = mikall_node::ts90k_diff_ms(mikall_node::ts90k_now(), frame.ts90k);
+        self.frames += 1;
+        self.feed_ms_sum += feed_ms;
+        self.feed_ms_max = self.feed_ms_max.max(feed_ms);
+        self.g2g_ms_sum += g2g_ms;
+        self.g2g_ms_max = self.g2g_ms_max.max(g2g_ms);
+        if self.window_start.elapsed() >= Duration::from_secs(1) {
+            let n = self.frames as f64;
+            tracing::info!(
+                frames = self.frames,
+                feed_ms_avg = format!("{:.2}", self.feed_ms_sum / n).as_str(),
+                feed_ms_max = format!("{:.2}", self.feed_ms_max).as_str(),
+                g2g_ms_avg = format!("{:.1}", self.g2g_ms_sum / n).as_str(),
+                g2g_ms_max = format!("{:.1}", self.g2g_ms_max).as_str(),
+                "video ui"
+            );
+            *self = VideoFeedStats::default();
+        }
+    }
+}
+
 /// The abortable accept-loop of a running gateway. `mikall_irc::serve`
 /// hands back a `JoinHandle`; keeping it (instead of M7's `_task` drop) is
 /// what makes the settings toggle able to stop the gateway live. Wrapped in
@@ -264,7 +316,10 @@ enum Msg {
     /// screen recording refused).
     MediaTrouble(MediaAlert),
     /// A decoded frame of a remote screen share arrived.
-    VideoFrame(RemoteVideoFrame),
+    /// A batch of decoded share pictures off the node's feed — at most
+    /// one (the newest) per (call, sharer): the subscription drains the
+    /// feed so the renderer never works through a backlog.
+    VideoFrames(Vec<RemoteVideoFrame>),
     /// Expand the viewer pane for a remote sharer (local view only).
     Watch(IdentityId),
     /// Collapse the viewer back to tiles (local view only — the sharer
@@ -320,6 +375,8 @@ struct Mikall {
     /// Where the identity key file lives — custody stays in mikall-crypto;
     /// the settings screen only names (and offers to copy) the file.
     key_path: PathBuf,
+    /// Render-feed latency accounting (per-second `video ui` log line).
+    video_stats: VideoFeedStats,
 }
 
 impl Mikall {
@@ -352,6 +409,7 @@ impl Mikall {
             irc_cfg: IrcGatewayConfig::default(),
             blocked: Vec::new(),
             key_path: data_dir().join("identity.key"),
+            video_stats: VideoFeedStats::default(),
         };
         let task = Task::perform(
             async {
@@ -1221,25 +1279,28 @@ impl Mikall {
                 self.alarm = Some(Alarm::Danger { title, body });
                 Task::none()
             }
-            Msg::VideoFrame(frame) => {
+            Msg::VideoFrames(frames) => {
                 // Only pictures of the call on the surface, and never our
                 // own (the sharer has no self-viewer).
                 let me = self.me();
-                if let Some(call) = &mut self.call {
-                    if call.id == frame.call && Some(frame.from) != me {
-                        call.frames.insert(
-                            frame.from,
-                            ShareFrame {
-                                handle: iced::widget::image::Handle::from_rgba(
-                                    frame.width,
-                                    frame.height,
-                                    frame.rgba.as_ref().clone(),
-                                ),
-                                width: frame.width,
-                                height: frame.height,
-                                via: frame.via,
-                            },
-                        );
+                for frame in frames {
+                    self.video_stats.observe(&frame);
+                    if let Some(call) = &mut self.call {
+                        if call.id == frame.call && Some(frame.from) != me {
+                            call.frames.insert(
+                                frame.from,
+                                ShareFrame {
+                                    handle: iced::widget::image::Handle::from_rgba(
+                                        frame.width,
+                                        frame.height,
+                                        frame.rgba.as_ref().clone(),
+                                    ),
+                                    width: frame.width,
+                                    height: frame.height,
+                                    via: frame.via,
+                                },
+                            );
+                        }
                     }
                 }
                 Task::none()
@@ -1495,7 +1556,28 @@ impl Mikall {
             futures::stream::unfold(node.subscribe_video_frames(), |mut rx| async move {
                 loop {
                     match rx.recv().await {
-                        Ok(frame) => return Some((Msg::VideoFrame(frame), rx)),
+                        Ok(first) => {
+                            let mut batch = vec![first];
+                            // Drain to the newest pending picture per
+                            // (call, sharer): frames that queued while
+                            // the UI repainted are stale — rendering
+                            // them would only replay a backlog.
+                            loop {
+                                match rx.try_recv() {
+                                    Ok(frame) => {
+                                        batch.retain(|old: &RemoteVideoFrame| {
+                                            old.call != frame.call || old.from != frame.from
+                                        });
+                                        batch.push(frame);
+                                    }
+                                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                                        continue
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            return Some((Msg::VideoFrames(batch), rx));
+                        }
                         // Lagging is by design: stale share pictures are
                         // dropped, the next fresh one wins.
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,

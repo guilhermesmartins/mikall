@@ -27,7 +27,7 @@ use mikall_domain::shared::IdentityId;
 
 use crate::control::{ControlMessage, FeedbackReport};
 use crate::frame::{open, peek_header, CallKey, MediaKind, FLAG_KEYFRAME};
-use crate::video::{SealedVideoFrame, VideoFanout};
+use crate::video::{SealedVideoFrame, TappedFrame, VideoFanout};
 
 /// The forwarder role, while assigned: relay `sharer`'s sealed video
 /// frames through `fanout` to the viewer set.
@@ -151,7 +151,7 @@ pub async fn run_video_pump(
     mut tap: mpsc::Receiver<(IdentityId, Vec<u8>)>,
     key: &CallKey,
     shared: Arc<PumpShared>,
-    decode_tx: mpsc::Sender<(IdentityId, Vec<u8>)>,
+    decode_tx: mpsc::Sender<TappedFrame>,
     events: mpsc::Sender<PumpEvent>,
     report_interval: Duration,
 ) -> PumpStats {
@@ -216,12 +216,14 @@ async fn route_frame(
     sealed: Vec<u8>,
     key: &CallKey,
     shared: &Arc<PumpShared>,
-    decode_tx: &mpsc::Sender<(IdentityId, Vec<u8>)>,
+    decode_tx: &mpsc::Sender<TappedFrame>,
     events: &mpsc::Sender<PumpEvent>,
     windows: &mut BTreeMap<IdentityId, OriginWindow>,
     relay_window: &mut (u64, u64),
     stats: &mut PumpStats,
 ) {
+    // Arrival stamp: the receive→decode queue wait is measured from here.
+    let arrived = std::time::Instant::now();
     let Ok(header) = peek_header(&sealed) else {
         stats.rejected += 1;
         return;
@@ -247,10 +249,10 @@ async fn route_frame(
             // header is read.
             if let Some(target) = shared.relay() {
                 if target.sharer == from {
-                    target.fanout.broadcast(&SealedVideoFrame {
-                        sealed: Arc::new(sealed.clone()),
-                        keyframe: header.flags & FLAG_KEYFRAME != 0,
-                    });
+                    target.fanout.broadcast(&SealedVideoFrame::new(
+                        Arc::new(sealed.clone()),
+                        header.flags & FLAG_KEYFRAME != 0,
+                    ));
                     stats.relayed += 1;
                     relay_window.0 += 1;
                     relay_window.1 += sealed.len() as u64;
@@ -275,7 +277,7 @@ async fn route_frame(
                     window.next_counter = Some(header.counter + 1);
                 }
             }
-            match decode_tx.try_send((origin, sealed)) {
+            match decode_tx.try_send((origin, sealed, arrived)) {
                 Ok(()) => stats.to_decode += 1,
                 Err(_) => stats.decode_dropped += 1,
             }
@@ -476,7 +478,7 @@ mod tests {
         // frames too (attributed to the transport sender absent an
         // origins map).
         for _ in 0..3 {
-            let (origin, _) = decode_rx.recv().await.unwrap();
+            let (origin, _, _) = decode_rx.recv().await.unwrap();
             assert_eq!(origin, sharer);
         }
 
@@ -497,10 +499,7 @@ mod tests {
         fanout.set_peers(vec![identity(2)]);
 
         let frames: Vec<SealedVideoFrame> = (0u8..3)
-            .map(|i| SealedVideoFrame {
-                sealed: Arc::new(vec![i; 8]),
-                keyframe: i == 0,
-            })
+            .map(|i| SealedVideoFrame::new(Arc::new(vec![i; 8]), i == 0))
             .collect();
         for frame in &frames {
             fanout.broadcast(frame);
@@ -659,7 +658,7 @@ mod tests {
             .send((forwarder, sealed_video(&key, ssrc, 0, true)))
             .await
             .unwrap();
-        let (origin, _) = decode_rx.recv().await.unwrap();
+        let (origin, _, _) = decode_rx.recv().await.unwrap();
         assert_eq!(origin, sharer);
         assert_eq!(shared.via_of(&sharer), Some(forwarder));
 
@@ -668,7 +667,7 @@ mod tests {
             .send((sharer, sealed_video(&key, ssrc, 1, false)))
             .await
             .unwrap();
-        let (origin, _) = decode_rx.recv().await.unwrap();
+        let (origin, _, _) = decode_rx.recv().await.unwrap();
         assert_eq!(origin, sharer);
         assert_eq!(shared.via_of(&sharer), None);
 

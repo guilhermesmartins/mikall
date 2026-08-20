@@ -25,6 +25,11 @@ use std::sync::Arc;
 use mikall_domain::calls::CallId;
 use mikall_domain::shared::IdentityId;
 
+/// 90 kHz wall-clock helpers re-exported for frontends: the frame feed's
+/// `ts90k` stamps come from this clock, and the renderer estimates
+/// glass-to-glass latency with them.
+pub use mikall_media::video::{ts90k_diff_ms, ts90k_now};
+
 /// One decoded remote picture for frontends, RGBA. Shared pixels: the
 /// broadcast clones the handle, never the frame.
 #[derive(Debug, Clone)]
@@ -39,6 +44,13 @@ pub struct RemoteVideoFrame {
     pub width: u32,
     pub height: u32,
     pub rgba: Arc<Vec<u8>>,
+    /// The sharer's wall-clock capture stamp (90 kHz video clock,
+    /// wrapping) — lets the renderer estimate glass-to-glass latency
+    /// when both ends share a wall clock (same machine).
+    pub ts90k: u32,
+    /// When the local receiver handed this picture to the feed — the
+    /// decode→render stage is measured from here.
+    pub decoded_at: std::time::Instant,
 }
 
 #[cfg(feature = "hardware-video")]
@@ -58,11 +70,14 @@ mod engine {
     use mikall_domain::calls::{CallEvent, CallId, CallPhase};
     use mikall_domain::shared::IdentityId;
     use mikall_domain::DomainEvent;
-    use mikall_media::capture::{ScapCapture, CAPTURE_FPS};
+    use mikall_media::capture::{ScapCapture, CAPTURE_FPS, CAPTURE_FPS_HW};
     use mikall_media::codec_h264::{H264Decoder, H264Encoder, MIN_BITRATE_BPS, TARGET_BITRATE_BPS};
+    #[cfg(target_os = "macos")]
+    use mikall_media::codec_vt::VtH264Encoder;
     use mikall_media::control::{BitrateController, ControlMessage, ControlPlane};
     use mikall_media::frame::CallKey;
     use mikall_media::relay::{run_video_pump, PumpEvent, PumpShared, RelayTarget};
+    use mikall_media::video::VideoEncoder;
     use mikall_media::video::{
         run_video_receiver, run_video_sender, video_ssrc_of, DecodedPicture, VideoDecoder,
         VideoFanout, VideoSenderControl, VideoSink,
@@ -184,7 +199,7 @@ mod engine {
     }
 
     impl VideoSink for FeedSink {
-        fn present(&mut self, from: IdentityId, picture: DecodedPicture) {
+        fn present(&mut self, from: IdentityId, picture: DecodedPicture, ts90k: u32) {
             let _ = self.feed.send(RemoteVideoFrame {
                 call: self.call,
                 from,
@@ -192,6 +207,8 @@ mod engine {
                 width: picture.width,
                 height: picture.height,
                 rgba: Arc::new(picture.rgba),
+                ts90k,
+                decoded_at: std::time::Instant::now(),
             });
         }
     }
@@ -482,6 +499,26 @@ mod engine {
         })
     }
 
+    /// Pick the best available encoder and the capture cadence it earns:
+    /// VideoToolbox hardware (macOS) at 15 fps — the spec's upper band,
+    /// affordable because the media engine does the per-frame work — with
+    /// software OpenH264 at 10 fps as the automatic fallback (non-macOS,
+    /// or a Mac whose hardware encoder refuses to initialize).
+    fn pick_encoder() -> Result<(Box<dyn VideoEncoder>, u32, &'static str), String> {
+        #[cfg(target_os = "macos")]
+        match VtH264Encoder::new(CAPTURE_FPS_HW, TARGET_BITRATE_BPS) {
+            Ok(encoder) => return Ok((Box::new(encoder), CAPTURE_FPS_HW, "videotoolbox")),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "video: VideoToolbox unavailable — falling back to software OpenH264"
+                );
+            }
+        }
+        let encoder = H264Encoder::new(CAPTURE_FPS).map_err(|e| e.to_string())?;
+        Ok((Box::new(encoder), CAPTURE_FPS, "openh264"))
+    }
+
     async fn start_send(
         call: CallId,
         me: IdentityId,
@@ -492,29 +529,22 @@ mod engine {
             .media_key(call)
             .await
             .ok_or_else(|| "no media key for active call".to_owned())?;
-        let (capture, frames) = ScapCapture::start(CAPTURE_FPS).map_err(|e| e.to_string())?;
-        let encoder = H264Encoder::new(CAPTURE_FPS).map_err(|e| e.to_string())?;
+        let (encoder, fps, codec) = pick_encoder()?;
+        let (capture, frames) = ScapCapture::start(fps).map_err(|e| e.to_string())?;
         // The sharer's own fan-out: no cache — forcing the shared encoder
         // is the cheaper primer when a lane of ours needs a keyframe.
         let fanout = VideoFanout::new(Arc::clone(streams), call);
         let sender_control = VideoSenderControl::new(TARGET_BITRATE_BPS);
         let key = CallKey::new(key_bytes);
         let ssrc = video_ssrc_of(&me);
-        tracing::info!(%call, ssrc, "video: starting screen share");
+        tracing::info!(%call, ssrc, codec, fps, "video: starting screen share");
         let task = tokio::spawn({
             let fanout = Arc::clone(&fanout);
             let sender_control = Arc::clone(&sender_control);
             async move {
-                let totals = run_video_sender(
-                    fanout,
-                    &key,
-                    ssrc,
-                    CAPTURE_FPS,
-                    sender_control,
-                    frames,
-                    Box::new(encoder),
-                )
-                .await;
+                let totals =
+                    run_video_sender(fanout, &key, ssrc, fps, sender_control, frames, encoder)
+                        .await;
                 tracing::info!(%call, ?totals, "video: sender finished");
             }
         });

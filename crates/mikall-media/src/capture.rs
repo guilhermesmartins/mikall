@@ -24,8 +24,15 @@ use tokio::sync::mpsc;
 
 use crate::video::CapturedFrame;
 
-/// Capture rate: the spec's 5–15 fps band, split down the middle.
+/// Capture rate with the software encoder: the spec's 5–15 fps band,
+/// split down the middle — the safe cadence for the weak-machine target.
 pub const CAPTURE_FPS: u32 = 10;
+
+/// Capture rate with hardware encoding: the spec's upper band. The
+/// dedicated encoder makes the per-frame cost near-free, so the extra
+/// frames buy smoothness *and* lower latency (a fresh frame exists 66 ms
+/// after a change instead of 100 ms) without touching the CPU budget.
+pub const CAPTURE_FPS_HW: u32 = 15;
 
 /// How often the last picture is re-emitted while the screen is static,
 /// so keyframe demands (late joiners) are never starved.
@@ -126,9 +133,25 @@ fn capture_thread(
 
     let mut last_full: Option<CapturedFrame> = None;
     let mut last_emit = Instant::now();
+    // Per-second capture stats: produced frames and frames dropped
+    // because the encoder had not drained the channel (capture→encode
+    // backlog — the first hop of the latency instrumentation).
+    let mut win_start = Instant::now();
+    let mut win_frames: u64 = 0;
+    let mut win_dropped: u64 = 0;
     loop {
         if stop.load(Ordering::Relaxed) || frame_tx.is_closed() {
             break;
+        }
+        if win_frames > 0 && win_start.elapsed() >= Duration::from_secs(1) {
+            tracing::info!(
+                fps = win_frames,
+                dropped_backlog = win_dropped,
+                "video capture"
+            );
+            win_start = Instant::now();
+            win_frames = 0;
+            win_dropped = 0;
         }
         let frame = match capturer.get_next_frame() {
             Ok(frame) => frame,
@@ -159,9 +182,12 @@ fn capture_thread(
         };
         last_full = Some(captured.clone());
         last_emit = Instant::now();
+        win_frames += 1;
         // Never block the capture thread; a full channel means the
         // encoder stalled and this frame is best dropped.
-        let _ = frame_tx.try_send(captured);
+        if frame_tx.try_send(captured).is_err() {
+            win_dropped += 1;
+        }
     }
     capturer.stop_capture();
     tracing::info!("video: screen capture stopped");

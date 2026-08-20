@@ -26,6 +26,10 @@
 //! - [`capture`] / [`codec_h264`] (feature `hardware-video`): the scap
 //!   screen-capture adapter and the OpenH264 encoder/decoder over the
 //!   [`video`] ports.
+//! - [`codec_vt`] (feature `hardware-video`, macOS): the VideoToolbox
+//!   *hardware* H.264 encoder behind the same
+//!   [`VideoEncoder`](video::VideoEncoder) port — the low-latency default
+//!   on macOS, with [`codec_h264`] as the automatic software fallback.
 //!
 //! Group calls are a full mesh (domain-capped at 8): each participant runs
 //! one sender toward every peer and one receiver per call. Video is
@@ -49,3 +53,5 @@ pub mod opus;
 pub mod capture;
 #[cfg(feature = "hardware-video")]
 pub mod codec_h264;
+#[cfg(all(feature = "hardware-video", target_os = "macos"))]
+pub mod codec_vt;

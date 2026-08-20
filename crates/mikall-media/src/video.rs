@@ -34,6 +34,25 @@ use crate::frame::{
 /// Video timestamps tick at the RTP video clock.
 pub const VIDEO_CLOCK_HZ: u32 = 90_000;
 
+/// The current wall clock in 90 kHz video-clock units, wrapping u32
+/// (one lap ≈ 13.25 h). Senders stamp every video frame's header `ts`
+/// with this, so a receiver can estimate glass-to-glass latency as
+/// `ts90k_now().wrapping_sub(header.ts)` — exact when both ends share a
+/// wall clock (two instances on one machine), per-stage-only across
+/// machines whose clocks drift.
+pub fn ts90k_now() -> u32 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    // 90 kHz ticks of the UNIX epoch, truncated to u32 (wrapping lap).
+    (now.as_nanos().wrapping_mul(9) / 100_000) as u32
+}
+
+/// Milliseconds represented by a wrapping 90 kHz tick difference.
+pub fn ts90k_diff_ms(later: u32, earlier: u32) -> f64 {
+    f64::from(later.wrapping_sub(earlier)) / 90.0
+}
+
 /// Frames wider than this are the capture adapter's job to avoid; the
 /// encoder port may refuse bigger pictures. Weak-machine ceiling for v1.
 pub const MAX_WIDTH: u32 = 1280;
@@ -107,6 +126,24 @@ pub fn downscale_to_max_width(mut frame: CapturedFrame, max_width: u32) -> Captu
     frame
 }
 
+/// Shape a captured frame for an encoder — the weak-machine width cap,
+/// then even dimensions (4:2:0 chroma) — **copying only when something
+/// actually changes**. macOS capture already delivers ≤1280-wide even
+/// frames, so the hot path borrows: the only per-frame pixel pass left in
+/// the encode loop is the codec's own colorspace read.
+pub fn shape_for_encode(
+    frame: &CapturedFrame,
+    max_width: u32,
+) -> std::borrow::Cow<'_, CapturedFrame> {
+    if frame.width <= max_width && frame.width & 1 == 0 && frame.height & 1 == 0 {
+        return std::borrow::Cow::Borrowed(frame);
+    }
+    std::borrow::Cow::Owned(crop_to_even(downscale_to_max_width(
+        frame.clone(),
+        max_width,
+    )))
+}
+
 /// One encoded picture out of the codec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedPicture {
@@ -153,27 +190,38 @@ pub trait VideoDecoder: Send {
 }
 
 /// Where decoded pictures land (the GUI's viewer pane in production, a
-/// collector in tests).
+/// collector in tests). `ts90k` is the sender's wall-clock capture stamp
+/// from the frame header ([`ts90k_now`]) — frontends use it for the
+/// glass-to-glass latency estimate at the moment they actually render.
 pub trait VideoSink: Send {
-    fn present(&mut self, from: IdentityId, picture: DecodedPicture);
+    fn present(&mut self, from: IdentityId, picture: DecodedPicture, ts90k: u32);
 }
 
 /// Screen content is mostly static: an unchanged picture costs nothing —
-/// it is simply not encoded. The comparison is exact bytes; macOS capture
-/// additionally suppresses unchanged frames at the source, this gate
-/// catches re-emitted heartbeats and any capture backend that does not.
+/// it is simply not encoded. The comparison is exact (a collision-free
+/// content hash); macOS capture additionally suppresses unchanged frames
+/// at the source, this gate catches re-emitted heartbeats and any capture
+/// backend that does not. Hashing instead of storing the frame keeps the
+/// gate O(read) with zero per-frame allocation — the old clone-and-memcmp
+/// wrote a full frame copy on every screen change, a measurable slice of
+/// the encode-loop budget at 1280-wide.
 #[derive(Debug, Default)]
 pub struct StaticFrameGate {
-    last: Option<CapturedFrame>,
+    last: Option<(u32, u32, [u8; 32])>,
 }
 
 impl StaticFrameGate {
     /// True when this frame differs from the last one that passed.
     pub fn changed(&mut self, frame: &CapturedFrame) -> bool {
-        if self.last.as_ref() == Some(frame) {
+        let signature = (
+            frame.width,
+            frame.height,
+            *blake3::hash(&frame.bgra).as_bytes(),
+        );
+        if self.last == Some(signature) {
             return false;
         }
-        self.last = Some(frame.clone());
+        self.last = Some(signature);
         true
     }
 }
@@ -184,6 +232,26 @@ impl StaticFrameGate {
 pub struct SealedVideoFrame {
     pub sealed: Arc<Vec<u8>>,
     pub keyframe: bool,
+    /// When this frame entered the fan-out (sealed by the sharer, or
+    /// received by a relay). Lane drain loops read it to report
+    /// queue-wait + send time per frame — the encode→send stage of the
+    /// latency instrumentation.
+    stamped: std::time::Instant,
+}
+
+impl SealedVideoFrame {
+    pub fn new(sealed: Arc<Vec<u8>>, keyframe: bool) -> Self {
+        SealedVideoFrame {
+            sealed,
+            keyframe,
+            stamped: std::time::Instant::now(),
+        }
+    }
+
+    /// How long ago this frame entered the fan-out.
+    pub fn age(&self) -> std::time::Duration {
+        self.stamped.elapsed()
+    }
 }
 
 /// What became of a pushed frame.
@@ -271,7 +339,13 @@ impl VideoSendQueue {
         }
         self.dropped += self.frames.len() as u64;
         self.frames.clear();
-        self.frames.extend(run.iter().cloned());
+        // Re-stamp: cached frames may be seconds old, and a primed lane's
+        // send timing must measure *this* lane, not the cache's age.
+        self.frames.extend(run.iter().map(|frame| {
+            let mut fresh = frame.clone();
+            fresh.stamped = std::time::Instant::now();
+            fresh
+        }));
         self.primed = self.frames.len();
         self.awaiting_keyframe = false;
     }
@@ -603,6 +677,13 @@ async fn run_lane(
     failures: Arc<AtomicU32>,
 ) {
     let mut stream = None;
+    // Per-second send-stage stats: how long each frame spent between
+    // entering the fan-out (seal/relay) and leaving on the wire — the
+    // encode→send hop of the latency instrumentation.
+    let mut win_start = std::time::Instant::now();
+    let mut win_sends: u64 = 0;
+    let mut win_tx_ms_sum: f64 = 0.0;
+    let mut win_tx_ms_max: f64 = 0.0;
     loop {
         // Stream first, frames second: nothing is consumed from the queue
         // until there is somewhere to send it, so the opening keyframe
@@ -650,6 +731,23 @@ async fn run_lane(
             match tokio::time::timeout(LANE_SEND_TIMEOUT, lane_stream.send(&frame.sealed)).await {
                 Ok(Ok(())) => {
                     failures.store(0, Ordering::Relaxed);
+                    let tx_ms = frame.age().as_secs_f64() * 1_000.0;
+                    win_sends += 1;
+                    win_tx_ms_sum += tx_ms;
+                    win_tx_ms_max = win_tx_ms_max.max(tx_ms);
+                    if win_start.elapsed() >= std::time::Duration::from_secs(1) {
+                        tracing::info!(
+                            %peer,
+                            sends = win_sends,
+                            tx_ms_avg = format!("{:.2}", win_tx_ms_sum / win_sends as f64).as_str(),
+                            tx_ms_max = format!("{win_tx_ms_max:.2}").as_str(),
+                            "video lane"
+                        );
+                        win_start = std::time::Instant::now();
+                        win_sends = 0;
+                        win_tx_ms_sum = 0.0;
+                        win_tx_ms_max = 0.0;
+                    }
                 }
                 Ok(Err(error)) => {
                     tracing::debug!(%peer, %call, %error, "video lane: send failed, reopening");
@@ -678,6 +776,9 @@ pub struct VideoSenderStats {
     pub encoded: u64,
     pub keyframes: u64,
     pub skipped_static: u64,
+    /// Captured frames dropped unencoded because a newer capture was
+    /// already pending (latest-wins on the capture channel).
+    pub skipped_stale: u64,
     pub encoded_bytes: u64,
 }
 
@@ -708,11 +809,17 @@ impl VideoSenderControl {
 /// Pump captured frames through gate → encoder → seal → fan-out until the
 /// capture channel closes. Returns totals. The frame is encoded and
 /// sealed exactly once regardless of viewer count.
+///
+/// Latest-wins on the capture channel: when more than one captured frame
+/// is pending (the encoder fell behind the capture cadence), everything
+/// but the newest is dropped *before* encoding — encoding stale pictures
+/// only adds latency to every viewer. Raw captures carry no inter-frame
+/// state, so skipping them is always safe (unlike encoded deltas).
 pub async fn run_video_sender(
     fanout: Arc<VideoFanout>,
     key: &CallKey,
     ssrc: u32,
-    fps_hint: u32,
+    _fps_hint: u32,
     control: Arc<VideoSenderControl>,
     mut frames: mpsc::Receiver<CapturedFrame>,
     mut encoder: Box<dyn VideoEncoder>,
@@ -722,9 +829,16 @@ pub async fn run_video_sender(
     let mut totals = VideoSenderStats::default();
     let mut window = VideoSenderStats::default();
     let mut window_start = std::time::Instant::now();
-    let ts_step = VIDEO_CLOCK_HZ / fps_hint.max(1);
+    let mut window_enc_ms_sum: f64 = 0.0;
+    let mut window_enc_ms_max: f64 = 0.0;
     let mut applied_bitrate = control.bitrate();
-    while let Some(frame) = frames.recv().await {
+    while let Some(mut frame) = frames.recv().await {
+        // Drain to the newest pending capture (latest-wins).
+        while let Ok(newer) = frames.try_recv() {
+            frame = newer;
+            totals.skipped_stale += 1;
+            window.skipped_stale += 1;
+        }
         let wanted_bitrate = control.bitrate();
         if wanted_bitrate != applied_bitrate {
             tracing::info!(
@@ -743,6 +857,11 @@ pub async fn run_video_sender(
             window.skipped_static += 1;
             continue;
         }
+        // Stamp *before* the encode: this is (approximately) when the
+        // pixels left the glass — the drain above keeps the gap between
+        // capture and this point within one frame interval.
+        let ts = ts90k_now();
+        let enc_start = std::time::Instant::now();
         let encoded = match encoder.encode(&frame, keyframe_wanted) {
             Ok(Some(encoded)) => encoded,
             Ok(None) => continue,
@@ -751,13 +870,16 @@ pub async fn run_video_sender(
                 break;
             }
         };
+        let enc_ms = enc_start.elapsed().as_secs_f64() * 1_000.0;
+        window_enc_ms_sum += enc_ms;
+        window_enc_ms_max = window_enc_ms_max.max(enc_ms);
         let mut flags = FLAG_END_OF_PICTURE;
         if encoded.keyframe {
             flags |= FLAG_KEYFRAME;
         }
         let header = FrameHeader {
             counter,
-            ts: (counter as u32).wrapping_mul(ts_step),
+            ts,
             ssrc,
             kind: MediaKind::Video,
             flags,
@@ -774,22 +896,29 @@ pub async fn run_video_sender(
             totals.keyframes += 1;
             window.keyframes += 1;
         }
-        fanout.broadcast(&SealedVideoFrame {
-            sealed: Arc::new(sealed),
-            keyframe: encoded.keyframe,
-        });
+        fanout.broadcast(&SealedVideoFrame::new(Arc::new(sealed), encoded.keyframe));
         if window_start.elapsed() >= std::time::Duration::from_secs(1) {
+            let enc_avg = if window.encoded > 0 {
+                window_enc_ms_sum / window.encoded as f64
+            } else {
+                0.0
+            };
             tracing::info!(
                 fps = window.encoded,
                 bytes_per_s = window.encoded_bytes,
                 keyframes = window.keyframes,
                 skipped_static = window.skipped_static,
+                skipped_stale = window.skipped_stale,
+                enc_ms_avg = format!("{enc_avg:.2}").as_str(),
+                enc_ms_max = format!("{window_enc_ms_max:.2}").as_str(),
                 tx_lanes = fanout.peer_count(),
                 dropped_total = fanout.dropped_total(),
                 bitrate_bps = applied_bitrate,
                 "video tx"
             );
             window = VideoSenderStats::default();
+            window_enc_ms_sum = 0.0;
+            window_enc_ms_max = 0.0;
             window_start = std::time::Instant::now();
         }
     }
@@ -800,6 +929,10 @@ pub async fn run_video_sender(
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct VideoReceiverStats {
     pub presented: u64,
+    /// Frames decoded (the H.264 delta chain needs every frame) but not
+    /// presented because a newer picture of the same sender was already
+    /// pending — the latest-wins render path.
+    pub presented_skipped: u64,
     /// Frames that failed AEAD authentication (dropped).
     pub rejected: u64,
     /// Deltas discarded while waiting for this sender's first keyframe.
@@ -818,14 +951,35 @@ struct RxLane {
     window_bytes: u64,
     window_frames: u64,
     window_start: std::time::Instant,
+    // Per-second stage timing: receive→decode queue wait, decode cost,
+    // and the glass-to-glass estimate at present time (sender wall-clock
+    // stamp → shared wall clock on one machine).
+    window_q_ms_sum: f64,
+    window_q_ms_max: f64,
+    window_dec_ms_sum: f64,
+    window_dec_ms_max: f64,
+    window_g2g_ms_sum: f64,
+    window_g2g_ms_max: f64,
+    window_presented: u64,
 }
+
+/// A sealed frame headed for the local decoder, stamped when it arrived
+/// off the network (the pump's tap) so the receive→decode queue wait is
+/// measurable.
+pub type TappedFrame = (IdentityId, Vec<u8>, std::time::Instant);
 
 /// Drain a call's video tap into the sink until the tap closes or
 /// `expect_frames` pictures have been presented. Streams are ordered per
 /// sender, so there is no jitter buffer: verify, gate on the first
 /// keyframe, decode, present. Each sender gets its own decoder.
+///
+/// Latest-wins presentation: every arrived frame is *decoded* (H.264
+/// deltas chain — skipping one would corrupt the stream until the next
+/// IDR), but when several frames are pending at once only the newest
+/// decoded picture per sender is *presented*. A viewer therefore always
+/// renders the freshest arrived picture instead of replaying a backlog.
 pub async fn run_video_receiver(
-    mut tap: mpsc::Receiver<(IdentityId, Vec<u8>)>,
+    mut tap: mpsc::Receiver<TappedFrame>,
     key: &CallKey,
     mut make_decoder: impl FnMut() -> Box<dyn VideoDecoder> + Send,
     sink: &mut dyn VideoSink,
@@ -839,61 +993,132 @@ pub async fn run_video_receiver(
                 break;
             }
         }
-        let Some((from, sealed)) = tap.recv().await else {
+        let Some(first) = tap.recv().await else {
             break;
         };
-        let (header, payload) = match open(key, &sealed) {
-            Ok(opened) => opened,
-            Err(_) => {
+        // Gather everything already pending: the batch is decoded in
+        // order, but only its newest picture per sender is presented.
+        let mut batch = vec![first];
+        while let Ok(more) = tap.try_recv() {
+            batch.push(more);
+        }
+        // Newest decodable picture per sender in this batch, with its
+        // capture stamp.
+        let mut freshest: BTreeMap<IdentityId, (DecodedPicture, u32)> = BTreeMap::new();
+        for (from, sealed, arrived) in batch {
+            let (header, payload) = match open(key, &sealed) {
+                Ok(opened) => opened,
+                Err(_) => {
+                    stats.rejected += 1;
+                    continue;
+                }
+            };
+            if header.kind != MediaKind::Video {
                 stats.rejected += 1;
                 continue;
             }
-        };
-        if header.kind != MediaKind::Video {
-            stats.rejected += 1;
-            continue;
+            let lane = lanes.entry(from).or_insert_with(|| RxLane {
+                decoder: make_decoder(),
+                synced: false,
+                next_counter: 0,
+                presented: 0,
+                window_bytes: 0,
+                window_frames: 0,
+                window_start: std::time::Instant::now(),
+                window_q_ms_sum: 0.0,
+                window_q_ms_max: 0.0,
+                window_dec_ms_sum: 0.0,
+                window_dec_ms_max: 0.0,
+                window_g2g_ms_sum: 0.0,
+                window_g2g_ms_max: 0.0,
+                window_presented: 0,
+            });
+            if lane.synced && header.counter < lane.next_counter {
+                stats.stale += 1;
+                continue;
+            }
+            let keyframe = header.flags & FLAG_KEYFRAME != 0;
+            if !lane.synced && !keyframe {
+                stats.discarded_pre_keyframe += 1;
+                continue;
+            }
+            lane.synced = true;
+            lane.next_counter = header.counter + 1;
+            lane.window_bytes += sealed.len() as u64;
+            lane.window_frames += 1;
+            let q_ms = arrived.elapsed().as_secs_f64() * 1_000.0;
+            lane.window_q_ms_sum += q_ms;
+            lane.window_q_ms_max = lane.window_q_ms_max.max(q_ms);
+            let dec_start = std::time::Instant::now();
+            let decoded = lane.decoder.decode(&payload);
+            let dec_ms = dec_start.elapsed().as_secs_f64() * 1_000.0;
+            lane.window_dec_ms_sum += dec_ms;
+            lane.window_dec_ms_max = lane.window_dec_ms_max.max(dec_ms);
+            if let Some(picture) = decoded {
+                if freshest.insert(from, (picture, header.ts)).is_some() {
+                    // An older decoded picture of this sender was pending:
+                    // superseded before it ever reached the sink.
+                    stats.presented_skipped += 1;
+                }
+            }
         }
-        let lane = lanes.entry(from).or_insert_with(|| RxLane {
-            decoder: make_decoder(),
-            synced: false,
-            next_counter: 0,
-            presented: 0,
-            window_bytes: 0,
-            window_frames: 0,
-            window_start: std::time::Instant::now(),
-        });
-        if lane.synced && header.counter < lane.next_counter {
-            stats.stale += 1;
-            continue;
+        for (from, (picture, ts)) in freshest {
+            if let Some(lane) = lanes.get_mut(&from) {
+                present(&mut stats, lane, sink, from, picture, ts);
+            }
         }
-        let keyframe = header.flags & FLAG_KEYFRAME != 0;
-        if !lane.synced && !keyframe {
-            stats.discarded_pre_keyframe += 1;
-            continue;
-        }
-        lane.synced = true;
-        lane.next_counter = header.counter + 1;
-        lane.window_bytes += sealed.len() as u64;
-        lane.window_frames += 1;
-        if let Some(picture) = lane.decoder.decode(&payload) {
-            lane.presented += 1;
-            stats.presented += 1;
-            sink.present(from, picture);
-        }
-        if lane.window_start.elapsed() >= std::time::Duration::from_secs(1) {
-            tracing::info!(
-                peer = %from,
-                fps = lane.window_frames,
-                bytes_per_s = lane.window_bytes,
-                presented = lane.presented,
-                "video rx"
-            );
-            lane.window_bytes = 0;
-            lane.window_frames = 0;
-            lane.window_start = std::time::Instant::now();
+        for (from, lane) in lanes.iter_mut() {
+            if lane.window_frames > 0
+                && lane.window_start.elapsed() >= std::time::Duration::from_secs(1)
+            {
+                let frames = lane.window_frames as f64;
+                let presented = lane.window_presented.max(1) as f64;
+                tracing::info!(
+                    peer = %from,
+                    fps = lane.window_frames,
+                    bytes_per_s = lane.window_bytes,
+                    presented = lane.presented,
+                    q_ms_avg = format!("{:.2}", lane.window_q_ms_sum / frames).as_str(),
+                    q_ms_max = format!("{:.2}", lane.window_q_ms_max).as_str(),
+                    dec_ms_avg = format!("{:.2}", lane.window_dec_ms_sum / frames).as_str(),
+                    dec_ms_max = format!("{:.2}", lane.window_dec_ms_max).as_str(),
+                    g2g_ms_avg = format!("{:.1}", lane.window_g2g_ms_sum / presented).as_str(),
+                    g2g_ms_max = format!("{:.1}", lane.window_g2g_ms_max).as_str(),
+                    "video rx"
+                );
+                lane.window_bytes = 0;
+                lane.window_frames = 0;
+                lane.window_q_ms_sum = 0.0;
+                lane.window_q_ms_max = 0.0;
+                lane.window_dec_ms_sum = 0.0;
+                lane.window_dec_ms_max = 0.0;
+                lane.window_g2g_ms_sum = 0.0;
+                lane.window_g2g_ms_max = 0.0;
+                lane.window_presented = 0;
+                lane.window_start = std::time::Instant::now();
+            }
         }
     }
     stats
+}
+
+/// Hand one picture to the sink and account for it (shared by the
+/// baseline per-frame path and the latest-wins batch path).
+fn present(
+    stats: &mut VideoReceiverStats,
+    lane: &mut RxLane,
+    sink: &mut dyn VideoSink,
+    from: IdentityId,
+    picture: DecodedPicture,
+    ts90k: u32,
+) {
+    let g2g_ms = ts90k_diff_ms(ts90k_now(), ts90k);
+    lane.window_g2g_ms_sum += g2g_ms;
+    lane.window_g2g_ms_max = lane.window_g2g_ms_max.max(g2g_ms);
+    lane.window_presented += 1;
+    lane.presented += 1;
+    stats.presented += 1;
+    sink.present(from, picture, ts90k);
 }
 
 #[cfg(test)]
@@ -922,10 +1147,7 @@ mod tests {
     }
 
     fn sealed_frame(tag: u8, keyframe: bool) -> SealedVideoFrame {
-        SealedVideoFrame {
-            sealed: Arc::new(vec![tag]),
-            keyframe,
-        }
+        SealedVideoFrame::new(Arc::new(vec![tag]), keyframe)
     }
 
     /// Deterministic fake codec: "encoding" prefixes a byte marking the
@@ -974,7 +1196,7 @@ mod tests {
     }
 
     impl VideoSink for CollectVideoSink {
-        fn present(&mut self, from: IdentityId, picture: DecodedPicture) {
+        fn present(&mut self, from: IdentityId, picture: DecodedPicture, _ts90k: u32) {
             self.pictures.push((from, picture));
         }
     }
@@ -1169,10 +1391,7 @@ mod tests {
         cache.observe(&sealed_frame(4, true));
         assert_eq!(cache.run().unwrap().len(), 1);
         // Overflow discards the whole run — a partial run is garbage.
-        let big = SealedVideoFrame {
-            sealed: Arc::new(vec![9; 64]),
-            keyframe: false,
-        };
+        let big = SealedVideoFrame::new(Arc::new(vec![9; 64]), false);
         cache.observe(&big);
         assert!(cache.run().is_none());
         // The next keyframe starts serving again.
@@ -1201,32 +1420,47 @@ mod tests {
 
         let key = CallKey::new([9; 32]);
         let (frame_tx, frame_rx) = mpsc::channel(8);
+        let sender = tokio::spawn({
+            let fanout = Arc::clone(&fanout);
+            let key = key.clone();
+            async move {
+                run_video_sender(
+                    fanout,
+                    &key,
+                    77,
+                    10,
+                    VideoSenderControl::new(1_500_000),
+                    frame_rx,
+                    Box::new(FakeEncoder {
+                        force_all_key: false,
+                        frames_seen: 0,
+                    }),
+                )
+                .await
+            }
+        });
+        // Paced like a live capture: wait for each frame to reach both
+        // lanes before sending the next, so the sender's latest-wins
+        // drain never collapses them.
         frame_tx.send(bgra(4, 4, 1)).await.unwrap();
+        for _ in 0..200 {
+            if sent.lock().await.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         frame_tx.send(bgra(4, 4, 5)).await.unwrap();
-        drop(frame_tx);
-        let totals = run_video_sender(
-            Arc::clone(&fanout),
-            &key,
-            77,
-            10,
-            VideoSenderControl::new(1_500_000),
-            frame_rx,
-            Box::new(FakeEncoder {
-                force_all_key: false,
-                frames_seen: 0,
-            }),
-        )
-        .await;
-        assert_eq!(totals.encoded, 2);
-        assert_eq!(totals.keyframes, 1);
-
-        // Wait for both lanes to drain both frames.
         for _ in 0..200 {
             if sent.lock().await.len() == 4 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
+        drop(frame_tx);
+        let totals = sender.await.unwrap();
+        assert_eq!(totals.encoded, 2);
+        assert_eq!(totals.keyframes, 1);
+
         let sent = sent.lock().await.clone();
         assert_eq!(sent.len(), 4, "2 frames × 2 viewers: {sent:?}");
         // The identical sealed bytes went to both peers: sealed once.
@@ -1345,8 +1579,11 @@ mod tests {
             push(2, 1, false, 21),
             push(1, 7, false, 12),
         ];
-        for frame in frames {
-            tap_tx.send(frame).await.unwrap();
+        for (from, sealed) in frames {
+            tap_tx
+                .send((from, sealed, std::time::Instant::now()))
+                .await
+                .unwrap();
         }
         drop(tap_tx);
 
@@ -1355,7 +1592,11 @@ mod tests {
         };
         let stats =
             run_video_receiver(tap_rx, &key, || Box::new(FakeDecoder), &mut sink, None).await;
-        assert_eq!(stats.presented, 4);
+        // Everything pending arrives as one backlog batch: every frame is
+        // decoded (the delta chain), but only the *newest* picture per
+        // sender reaches the sink — latest-wins rendering.
+        assert_eq!(stats.presented, 2);
+        assert_eq!(stats.presented_skipped, 2);
         assert_eq!(stats.discarded_pre_keyframe, 1);
         assert_eq!(stats.rejected, 0);
         let from_1: Vec<u8> = sink
@@ -1370,8 +1611,58 @@ mod tests {
             .filter(|(who, _)| *who == identity(2))
             .map(|(_, p)| p.rgba[0])
             .collect();
-        assert_eq!(from_1, vec![11, 12]);
-        assert_eq!(from_2, vec![20, 21]);
+        assert_eq!(from_1, vec![12], "only sender 1's newest picture");
+        assert_eq!(from_2, vec![21], "only sender 2's newest picture");
+    }
+
+    /// Frames that arrive one at a time (a live share at capture cadence)
+    /// are presented one at a time — latest-wins only collapses an actual
+    /// backlog, never a healthy stream.
+    #[tokio::test]
+    async fn receiver_presents_every_frame_when_none_are_backlogged() {
+        let key = CallKey::new([5; 32]);
+        let (tap_tx, tap_rx) = mpsc::channel(64);
+        let push = |counter: u64, keyframe: bool, fill: u8| {
+            let mut bytes = vec![u8::from(keyframe)];
+            bytes.extend_from_slice(&4u32.to_be_bytes());
+            bytes.extend_from_slice(&4u32.to_be_bytes());
+            bytes.extend_from_slice(&[fill; 64]);
+            let header = FrameHeader {
+                counter,
+                ts: 0,
+                ssrc: 1,
+                kind: MediaKind::Video,
+                flags: FLAG_END_OF_PICTURE | if keyframe { FLAG_KEYFRAME } else { 0 },
+            };
+            (identity(1), seal(&key, header, &bytes).unwrap())
+        };
+        let receiver = tokio::spawn({
+            let key = key.clone();
+            async move {
+                let mut sink = CollectVideoSink {
+                    pictures: Vec::new(),
+                };
+                let stats =
+                    run_video_receiver(tap_rx, &key, || Box::new(FakeDecoder), &mut sink, Some(3))
+                        .await;
+                (stats, sink.pictures)
+            }
+        });
+        for (counter, fill) in [(0u64, 10u8), (1, 11), (2, 12)] {
+            let (from, sealed) = push(counter, counter == 0, fill);
+            tap_tx
+                .send((from, sealed, std::time::Instant::now()))
+                .await
+                .unwrap();
+            // Let the receiver drain before the next frame exists.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        drop(tap_tx);
+        let (stats, pictures) = receiver.await.unwrap();
+        assert_eq!(stats.presented, 3);
+        assert_eq!(stats.presented_skipped, 0);
+        let fills: Vec<u8> = pictures.iter().map(|(_, p)| p.rgba[0]).collect();
+        assert_eq!(fills, vec![10, 11, 12]);
     }
 
     #[tokio::test]
@@ -1404,8 +1695,14 @@ mod tests {
             b"opus",
         )
         .unwrap();
-        tap_tx.send((identity(1), alien)).await.unwrap();
-        tap_tx.send((identity(2), audio)).await.unwrap();
+        tap_tx
+            .send((identity(1), alien, std::time::Instant::now()))
+            .await
+            .unwrap();
+        tap_tx
+            .send((identity(2), audio, std::time::Instant::now()))
+            .await
+            .unwrap();
         drop(tap_tx);
         let mut sink = CollectVideoSink {
             pictures: Vec::new(),

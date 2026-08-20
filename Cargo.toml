@@ -55,6 +55,12 @@ audiopus = "0.2"
 cpal = "0.15"
 openh264 = "0.9"
 scap = "0.1.0-beta.1"
+# VideoToolbox hardware H.264 (macOS): the maintained objc2 framework
+# bindings — typed CF smart pointers instead of hand-rolled FFI.
+objc2-core-foundation = "0.3"
+objc2-core-media = "0.3"
+objc2-core-video = "0.3"
+objc2-video-toolbox = "0.3"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -72,6 +78,14 @@ opt-level = 3
 [profile.dev.package.openh264-sys2]
 opt-level = 3
 [profile.dev.package.scap]
+opt-level = 3
+[profile.dev.package.objc2-core-foundation]
+opt-level = 3
+[profile.dev.package.objc2-core-media]
+opt-level = 3
+[profile.dev.package.objc2-core-video]
+opt-level = 3
+[profile.dev.package.objc2-video-toolbox]
 opt-level = 3
 [profile.dev.package.mikall-media]
 opt-level = 3

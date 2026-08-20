@@ -14,9 +14,18 @@ default = []
 ## feature — only the device and codec adapters live behind it.
 hardware-audio = ["dep:audiopus", "dep:cpal"]
 ## Screen capture via scap (ScreenCaptureKit on macOS) plus H.264 coding
-## via the bundled OpenH264. Same discipline: the video pipeline itself
-## never needs the feature — only the capture and codec adapters do.
-hardware-video = ["dep:scap", "dep:openh264"]
+## via the bundled OpenH264, and — on macOS — hardware H.264 via
+## VideoToolbox behind the same codec ports. Same discipline: the video
+## pipeline itself never needs the feature — only the capture and codec
+## adapters do.
+hardware-video = [
+    "dep:scap",
+    "dep:openh264",
+    "dep:objc2-core-foundation",
+    "dep:objc2-core-media",
+    "dep:objc2-core-video",
+    "dep:objc2-video-toolbox",
+]
 
 [dependencies]
 mikall-domain = { workspace = true }
@@ -25,10 +34,22 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
 tracing = { workspace = true }
 chacha20poly1305 = { workspace = true }
+## Content hash for the static-frame gate: exact-repeat detection without
+## keeping (or copying) a whole reference frame.
+blake3 = { workspace = true }
 audiopus = { workspace = true, optional = true }
 cpal = { workspace = true, optional = true }
 openh264 = { workspace = true, optional = true }
 scap = { workspace = true, optional = true }
+
+## VideoToolbox hardware H.264 — macOS only; on other targets the
+## `hardware-video` feature simply never activates these and the software
+## OpenH264 adapter is the whole codec story.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { workspace = true, optional = true }
+objc2-core-media = { workspace = true, optional = true }
+objc2-core-video = { workspace = true, optional = true }
+objc2-video-toolbox = { workspace = true, optional = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }

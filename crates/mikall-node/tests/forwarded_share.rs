@@ -95,7 +95,7 @@ struct SharedSink {
 }
 
 impl VideoSink for SharedSink {
-    fn present(&mut self, from: IdentityId, picture: DecodedPicture) {
+    fn present(&mut self, from: IdentityId, picture: DecodedPicture, _ts90k: u32) {
         if let Ok(mut pictures) = self.pictures.lock() {
             pictures.push((from, picture.rgba));
         }
@@ -373,22 +373,38 @@ async fn forwarder_relays_and_the_share_survives_its_death() {
     }
 
     // The viewer rendered the sharer's pixels byte-for-byte — carried by
-    // the forwarder, attributed to the sharer.
+    // the forwarder, attributed to the sharer. Latest-wins presentation
+    // may legally skip intermediate pictures under scheduling stalls, so
+    // the promise is: the newest picture lands, and everything presented
+    // is byte-exact, ordered, and attributed to the sharer.
     wait_for(
-        || pictures.lock().unwrap().len() >= 5,
-        "5 pictures at the viewer via the forwarder",
+        || {
+            pictures
+                .lock()
+                .unwrap()
+                .last()
+                .is_some_and(|(_, rgba)| rgba.first() == Some(&4))
+        },
+        "the newest picture at the viewer via the forwarder",
     )
     .await;
     {
         let got = pictures.lock().unwrap();
-        for (step, (from, rgba)) in got.iter().take(5).enumerate() {
+        let mut steps = Vec::new();
+        for (from, rgba) in got.iter() {
             assert_eq!(*from, a_id, "attributed to the sharer, not the relay");
+            let step = rgba[0];
             assert_eq!(
                 *rgba,
-                test_frame(step as u8).bgra,
+                test_frame(step).bgra,
                 "picture {step} must survive seal → relay → open byte-for-byte"
             );
+            steps.push(step);
         }
+        assert!(
+            steps.windows(2).all(|pair| pair[0] < pair[1]),
+            "presented pictures must be strictly newer, never a replay: {steps:?}"
+        );
     }
     assert_eq!(
         v_shared.via_of(&a_id),

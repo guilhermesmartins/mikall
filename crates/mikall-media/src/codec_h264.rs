@@ -12,13 +12,15 @@
 //! justify the platform glue.
 
 use openh264::decoder::Decoder;
-use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, FrameType, UsageType};
+use openh264::encoder::{
+    BitRate, Complexity, Encoder, EncoderConfig, FrameRate, FrameType, RateControlMode, UsageType,
+};
 use openh264::formats::{BgraSliceU8, YUVBuffer, YUVSource};
 use openh264::OpenH264API;
 
 use crate::video::{
-    crop_to_even, downscale_to_max_width, CapturedFrame, DecodedPicture, EncodedPicture,
-    VideoDecoder, VideoEncoder, VideoError, MAX_WIDTH,
+    shape_for_encode, CapturedFrame, DecodedPicture, EncodedPicture, VideoDecoder, VideoEncoder,
+    VideoError, MAX_WIDTH,
 };
 
 /// Target bitrate: generous for 1280-wide screen content at 10 fps, small
@@ -71,6 +73,20 @@ impl H264Encoder {
             .usage_type(UsageType::ScreenContentRealTime)
             .max_frame_rate(FrameRate::from_hz(fps.max(1) as f32))
             .bitrate(BitRate::from_bps(bitrate_bps))
+            // Real-time tuning (this encoder is the fallback path — it
+            // must hold the frame budget on the weak-machine target):
+            // - Low complexity trades a little compression efficiency for
+            //   the fastest mode decisions; at screen-share bitrates the
+            //   visual difference is negligible, the ms/frame saving is
+            //   not (latency is paid by every viewer on every frame).
+            // - Strict bitrate-mode rate control keeps frame sizes near
+            //   target so a slow uplink never queues a burst — a byte
+            //   backlog at the lane *is* latency (and triggers run drops).
+            // - Frame skipping stays on: when rate control must choose,
+            //   skipping a frame beats delaying every following one.
+            .complexity(Complexity::Low)
+            .rate_control_mode(RateControlMode::Bitrate)
+            .skip_frames(true)
             .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(
                 INTRA_PERIOD_FRAMES,
             ));
@@ -104,8 +120,10 @@ impl VideoEncoder for H264Encoder {
                 );
             }
         }
-        // Normalize: the weak-machine width cap, then even dimensions.
-        let shaped = crop_to_even(downscale_to_max_width(frame.clone(), MAX_WIDTH));
+        // Normalize: the weak-machine width cap, then even dimensions —
+        // borrowing when already conformant, so the only pixel pass in
+        // the hot loop is the single BGRA→YUV conversion below.
+        let shaped = shape_for_encode(frame, MAX_WIDTH);
         let (w, h) = (shaped.width as usize, shaped.height as usize);
         if shaped.bgra.len() != w * h * 4 {
             return Err(VideoError::BadDimensions(frame.width, frame.height));

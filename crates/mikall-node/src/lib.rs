@@ -20,7 +20,7 @@ use mikall_store::{FsBlobStore, RedbStore};
 
 pub mod video;
 pub mod voice;
-pub use video::RemoteVideoFrame;
+pub use video::{ts90k_diff_ms, ts90k_now, RemoteVideoFrame};
 pub use voice::MediaAlert;
 
 #[derive(Debug, thiserror::Error)]

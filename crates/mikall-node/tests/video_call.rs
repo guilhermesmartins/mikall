@@ -8,7 +8,7 @@
 #![allow(clippy::expect_used)]
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use mikall_domain::calls::CallPhase;
@@ -86,13 +86,20 @@ impl VideoDecoder for FakeDecoder {
     }
 }
 
+type Pictures = Arc<StdMutex<Vec<(IdentityId, DecodedPicture)>>>;
+
+/// Pictures land in shared state so the test can watch them arrive live
+/// (the latest-wins receiver only guarantees the *newest* frame lands, so
+/// the test must observe progress rather than block on an exact count).
 struct CollectPictures {
-    pictures: Vec<(IdentityId, DecodedPicture)>,
+    pictures: Pictures,
 }
 
 impl VideoSink for CollectPictures {
-    fn present(&mut self, from: IdentityId, picture: DecodedPicture) {
-        self.pictures.push((from, picture));
+    fn present(&mut self, from: IdentityId, picture: DecodedPicture, _ts90k: u32) {
+        if let Ok(mut pictures) = self.pictures.lock() {
+            pictures.push((from, picture));
+        }
     }
 }
 
@@ -135,24 +142,31 @@ async fn video_rides_streams_while_voice_rides_the_old_path() {
     assert_eq!(Some(key_bytes), bob.calls.media_key(call).await);
 
     // B taps both kinds. A shares: video over the stream transport.
-    let video_tap = bob.calls.video_tap(call).await;
+    let mut video_tap = bob.calls.video_tap(call).await;
     let audio_tap = bob.calls.media_tap(call).await;
 
+    // In production the pump stamps arrival times into the decode lane;
+    // here a plain adapter does (the pump has its own test).
+    let (stamped_tx, stamped_rx) = tokio::sync::mpsc::channel(64);
+    tokio::spawn(async move {
+        while let Some((from, sealed)) = video_tap.recv().await {
+            if stamped_tx
+                .send((from, sealed, std::time::Instant::now()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let pictures: Pictures = Arc::new(StdMutex::new(Vec::new()));
     let video_receiver = tokio::spawn({
         let key = CallKey::new(key_bytes);
+        let mut sink = CollectPictures {
+            pictures: Arc::clone(&pictures),
+        };
         async move {
-            let mut sink = CollectPictures {
-                pictures: Vec::new(),
-            };
-            let stats = run_video_receiver(
-                video_tap,
-                &key,
-                || Box::new(FakeDecoder),
-                &mut sink,
-                Some(5),
-            )
-            .await;
-            (stats, sink.pictures)
+            run_video_receiver(stamped_rx, &key, || Box::new(FakeDecoder), &mut sink, None).await
         }
     });
     let audio_receiver = tokio::spawn({
@@ -212,26 +226,54 @@ async fn video_rides_streams_while_voice_rides_the_old_path() {
         .await
         .expect("video sender timed out")
         .unwrap();
-    assert_eq!(video_totals.encoded, 5);
-    assert_eq!(video_totals.keyframes, 1);
+    // Latest-wins at both ends: a scheduling stall may legally collapse
+    // paced frames, so exact counts are not promised — but the *newest*
+    // picture always is, and whatever is presented must be byte-exact and
+    // in order.
+    assert!(
+        video_totals.encoded >= 1 && video_totals.encoded <= 5,
+        "encoded {} of 5",
+        video_totals.encoded
+    );
+    assert!(video_totals.keyframes >= 1);
 
-    // The viewer got every picture, byte-for-byte, in order — and not a
+    // The newest picture (step 4) must reach the viewer; every presented
+    // picture is byte-exact, ordered, and attributed to Alice — and not a
     // single audio frame leaked into the video lane (or vice versa).
-    let (video_stats, pictures) = tokio::time::timeout(Duration::from_secs(15), video_receiver)
-        .await
-        .expect("video receiver timed out")
-        .unwrap();
-    assert_eq!(video_stats.presented, 5);
-    assert_eq!(video_stats.rejected, 0);
-    assert_eq!(video_stats.discarded_pre_keyframe, 0);
-    assert_eq!(pictures.len(), 5);
-    for (step, (from, picture)) in pictures.iter().enumerate() {
-        assert_eq!(*from, alice.identity.local_id());
-        let expected = test_frame(step as u8);
-        assert_eq!((picture.width, picture.height), (16, 8));
-        assert_eq!(
-            picture.rgba, expected.bgra,
-            "picture {step} must survive encode → seal → stream → open → decode byte-for-byte"
+    for _ in 0..200 {
+        let done = pictures
+            .lock()
+            .unwrap()
+            .last()
+            .is_some_and(|(_, picture)| picture.rgba.first() == Some(&4));
+        if done {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    {
+        let got = pictures.lock().unwrap();
+        assert!(
+            got.last()
+                .is_some_and(|(_, picture)| picture.rgba.first() == Some(&4)),
+            "the newest picture must always land; got {} pictures",
+            got.len()
+        );
+        let mut steps = Vec::new();
+        for (from, picture) in got.iter() {
+            assert_eq!(*from, alice.identity.local_id());
+            assert_eq!((picture.width, picture.height), (16, 8));
+            let step = picture.rgba[0];
+            assert_eq!(
+                picture.rgba,
+                test_frame(step).bgra,
+                "picture {step} must survive encode → seal → stream → open → decode byte-for-byte"
+            );
+            steps.push(step);
+        }
+        assert!(
+            steps.windows(2).all(|pair| pair[0] < pair[1]),
+            "presented pictures must be strictly newer, never a replay: {steps:?}"
         );
     }
 
@@ -252,6 +294,14 @@ async fn video_rides_streams_while_voice_rides_the_old_path() {
     assert_eq!(samples, expected_pcm, "voice must be untouched by video");
 
     alice.calls.hang_up_all(call).await.unwrap();
+    // Hanging up removes the tap; the receiver drains out and reports.
+    let video_stats = tokio::time::timeout(Duration::from_secs(15), video_receiver)
+        .await
+        .expect("video receiver timed out")
+        .unwrap();
+    assert_eq!(video_stats.rejected, 0);
+    assert_eq!(video_stats.discarded_pre_keyframe, 0);
+    assert_eq!(video_stats.presented, pictures.lock().unwrap().len() as u64);
     alice.shutdown();
     bob.shutdown();
     let _ = std::fs::remove_dir_all(&base);
